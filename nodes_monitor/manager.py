@@ -1,0 +1,1330 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""nodes monitor workbench — Python implementation (replaces manager.sh).
+
+A persistent control panel for the multi-node GPU monitor:
+
+    python3 manager.py [--config FILE] [--exclude 1,3]
+
+Commands at the `cmd` prompt:
+    kill N | kill all | kill 1,2,3   kill every GPU process on the node(s)
+    train [N|1,2]                    occupy node(s) NOW — only when idle
+    try_train [N|1,2]                arm background occupation (auto-launch
+                                     as soon as a node goes idle)
+    release N | release all          stop try_train and kill only our
+                                     tagged trainer processes
+    theme NAME                       table | icons | dashboard | status
+    help                             show this help
+    quit | exit | q                  leave the workbench
+
+Architecture (why this is not bash):
+  * A background thread collects node states; the main thread only reads the
+    shared dict — keystrokes are never blocked by ssh/docker.
+  * Input is a select() on stdin in cbreak mode; terminal restoration on exit
+    is an explicit termios.tcsetattr (no hidden bash `read` restore).
+  * Column alignment uses unicodedata.east_asian_width — exact terminal
+    display width regardless of the shell's locale.
+"""
+
+import os
+import re
+import sys
+import time
+import signal
+import shlex
+import select
+import argparse
+import subprocess
+import threading
+import unicodedata
+import termios
+import tty
+from collections import deque
+
+try:
+    import tomllib  # python >= 3.11
+except ModuleNotFoundError:  # pragma: no cover
+    sys.exit("manager.py needs python3 >= 3.11 (tomllib)")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+UTILS_ROOT = os.path.dirname(SCRIPT_DIR)
+
+# ---------------------------------------------------------------------------
+# ANSI colors / styles
+# ---------------------------------------------------------------------------
+R = "\033[0m"
+BOLD = "\033[1m"
+RED = "\033[31m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+BLUE = "\033[34m"
+MAGENTA = "\033[35m"
+CYAN = "\033[36m"
+GRAY = "\033[90m"
+
+# ---------------------------------------------------------------------------
+# Config / state
+# ---------------------------------------------------------------------------
+CONF = {}
+IPS = []
+EXCLUDE = set()          # 0-based indices to skip
+STATS = {}               # idx -> (total, compute, state)
+STATS_LOCK = threading.Lock()
+PENDING_TRY = set()      # ips armed for try_train
+LAST_TRY_LAUNCH = {}     # ip -> epoch of last launch attempt
+MESSAGE = ""
+INPUT = ""
+THEME = "table"
+COLS = 80
+FRAME_W = 0
+OLD_TERM = None
+QUIT = False
+
+MARKER = "__UTILS_train_job__"
+PGREP_PATTERN = None  # derived from the marker in setup()
+
+# Trainers launched by THIS session; cleanup() kills them on exit so no
+# process is ever left behind on the nodes, however we end.
+LAUNCHED = set()        # ip -> trainer launched (kill on exit)
+LAUNCH_THREADS = []     # in-flight launch threads (join before the kill)
+EDGE = ""               # ANSI color for the frame borders (per theme)
+
+# ---------------------------------------------------------------------------
+# Width / alignment helpers (locale-independent)
+# ---------------------------------------------------------------------------
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# Box-drawing/symbol glyphs (─│╭╮●◆▲↻⊘…, EAW 'A') are assumed to render at
+# 1 column, which virtually all terminals do. If a terminal renders them at
+# 2 columns, borders will drift — that is a terminal-width assumption, not a
+# bug in the layout math.
+AMBIG_WIDTH = 1
+
+
+def char_width(c):
+    eaw = unicodedata.east_asian_width(c)
+    if eaw in "WF":
+        return 2
+    if eaw == "A":
+        return AMBIG_WIDTH
+    return 1
+
+
+def vis_width(s):
+    """Terminal display width of s with ANSI codes stripped. Wide (CJK etc.)
+    characters count 2 columns via unicodedata — independent of locale."""
+    s = _ANSI_RE.sub("", s)
+    return sum(char_width(c) for c in s)
+
+
+def pad_to(s, width):
+    """Right-pad (possibly colored) s to an exact visible width; over-wide
+    content is truncated (with …) so borders can never be pushed apart."""
+    if vis_width(s) > width:
+        s = trunc_vis(s, width)
+    return s + " " * max(0, width - vis_width(s))
+
+
+def trunc_vis(s, width):
+    """Truncate (possibly colored) s to `width` visible columns, keeping ANSI
+    codes intact; when cut, one column is reserved for the trailing '…'."""
+    if vis_width(s) <= width:
+        return s
+    out = []
+    n = 0
+    i = 0
+    while i < len(s):
+        m = _ANSI_RE.match(s, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        c = s[i]
+        w = char_width(c)
+        if n + 1 + w > width:      # leave one column for the ellipsis
+            break
+        out.append(c)
+        n += w
+        i += 1
+    return "".join(out) + R + "…"
+
+
+def tail_vis(s, width):
+    """Return the TAIL of plain-text s that fits into `width` visible columns
+    — what a typist needs to see of an over-long command line."""
+    w = 0
+    i = len(s)
+    while i > 0:
+        cw = char_width(s[i - 1])
+        if w + cw > width:
+            break
+        w += cw
+        i -= 1
+    return s[i:]
+
+
+# ---------------------------------------------------------------------------
+# Config loading (same resolution order as the shell version)
+# ---------------------------------------------------------------------------
+def load_config(cfg_file=None):
+    global CONF, INTERVAL, COOLDOWN, COMPUTE_THRESHOLD, MEM_THRESHOLD, LOG_FILE
+    global AMBIG_WIDTH
+    candidates = []
+    if cfg_file:
+        candidates.append(cfg_file)
+    else:
+        candidates = [
+            os.path.join(UTILS_ROOT, ".data", "nodes_monitor", "config.toml"),
+            os.path.join(SCRIPT_DIR, "config.toml"),
+        ]
+    path = None
+    for c in candidates:
+        if os.path.isfile(c):
+            path = c
+            break
+    if path is None:
+        sys.exit(f"Error: no config.toml found (looked in {candidates})")
+    with open(path, "rb") as fh:
+        CONF = tomllib.load(fh)
+
+    ssh = CONF.get("ssh", {})
+    mon = CONF.get("monitor", {})
+    ui = CONF.get("ui", {})
+    INTERVAL = int(mon.get("interval", 5))
+    COOLDOWN = int(mon.get("cooldown", 60))
+    COMPUTE_THRESHOLD = int(mon.get("compute_threshold", 0))
+    MEM_THRESHOLD = int(mon.get("mem_used_threshold", 100))
+    LOG_FILE = mon.get("log_file", "/tmp/utils_train.log")
+
+
+def load_nodes():
+    global IPS
+    nodes = CONF.get("nodes", {})
+    if nodes.get("list"):
+        IPS = list(nodes["list"])
+    else:
+        f = nodes.get("file") or os.path.join(SCRIPT_DIR, "nodes.conf")
+        if not f.startswith("/"):
+            f = os.path.join(UTILS_ROOT, f)
+        try:
+            with open(f) as fh:
+                IPS = [ln.split("#")[0].strip() for ln in fh]
+                IPS = [ln for ln in IPS if ln]
+        except OSError as exc:
+            sys.exit(f"Error: node list file not readable: {f} ({exc})")
+    if not IPS:
+        sys.exit("Error: no nodes configured ([nodes] list or file)")
+
+
+# ---------------------------------------------------------------------------
+# Remote execution
+# ---------------------------------------------------------------------------
+def local_ips():
+    try:
+        out = subprocess.run(["hostname", "-I"], capture_output=True, text=True,
+                             timeout=5).stdout.split()
+        return set(out)
+    except Exception:
+        return set()
+
+
+LOCAL_IPS = local_ips()
+
+
+def is_local(ip):
+    return ip in LOCAL_IPS
+
+
+def ssh_opts():
+    ssh = CONF.get("ssh", {})
+    opts = [
+        "-p", str(ssh.get("port", 2222)),
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=5",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=3",
+        "-o", "BatchMode=yes",
+        "-o", "LogLevel=ERROR",
+    ]
+    if ssh.get("identity"):
+        opts += ["-i", ssh["identity"]]
+    return opts
+
+
+def run_node(ip, cmd, timeout=30):
+    """Run cmd in the target environment; return (rc, stdout_text)."""
+    if is_local(ip):
+        try:
+            p = subprocess.run(["docker", "exec", CONF.get("env", {}).get("container", ""),
+                                "bash", "-c", cmd],
+                               capture_output=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return (124, "")
+        except (FileNotFoundError, OSError):
+            return (127, "")
+        return (p.returncode, p.stdout.decode("utf-8", "replace"))
+    try:
+        p = subprocess.run(["ssh", *ssh_opts(), ip, "bash -c " + shlex.quote(cmd)],
+                           capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return (124, "")
+    except (FileNotFoundError, OSError):
+        return (127, "")
+    return (p.returncode, p.stdout.decode("utf-8", "replace"))
+
+
+# ---------------------------------------------------------------------------
+# Node state
+# ---------------------------------------------------------------------------
+def fetch_gpu_data(ip):
+    return run_node(
+        ip,
+        "nvidia-smi --query-gpu=index,utilization.gpu,memory.used,memory.total "
+        "--format=csv,noheader,nounits",
+    )
+
+
+def node_reachable(ip):
+    return run_node(ip, "true")[0] == 0
+
+
+def check_trainer(ip):
+    return run_node(ip, f"pgrep -f '{PGREP_PATTERN}'")[0] == 0
+
+
+def probe_cuda(ip):
+    prefix = CONF.get("trainer", {}).get("probe_command", "")
+    ws = CONF.get("paths", {}).get("workspace_root", "")
+    probe = os.path.join(ws, "UTILS", "nodes_monitor", "cuda_probe.py")
+    return run_node(ip, f"{prefix}python3 {probe}")[0]
+
+
+PROBE_TS = {}      # ip -> (epoch, verdict 0/1/2)
+PROBE_FAILS = {}   # ip -> consecutive rc=1 failures
+PROBE_FAIL_THRESHOLD = 3
+
+
+def probe_cuda_cached(ip):
+    """0 = healthy, 1 = confirmed BROKEN (PROBE_FAIL_THRESHOLD consecutive
+    rc=1 failures), 2 = inconclusive (transport/environment failure — NOT a
+    GPU verdict; callers must not treat it as BROKEN)."""
+    now = time.time()
+    if ip in PROBE_TS and now - PROBE_TS[ip][0] < COOLDOWN:
+        return PROBE_TS[ip][1]
+    rc = probe_cuda(ip)
+    if rc == 0:
+        PROBE_FAILS[ip] = 0
+        verdict = 0
+    elif rc == 1:
+        PROBE_FAILS[ip] = PROBE_FAILS.get(ip, 0) + 1
+        verdict = 1 if PROBE_FAILS[ip] >= PROBE_FAIL_THRESHOLD else 2
+    else:
+        verdict = 2
+    PROBE_TS[ip] = (now, verdict)
+    return verdict
+
+
+def get_node_state(ip):
+    """Return (total, compute, state)."""
+    rc, data = fetch_gpu_data(ip)
+    if rc != 0:
+        return (-1, 0, "BROKEN" if node_reachable(ip) else "OFFLINE")
+    if not data.strip():
+        return (-1, 0, "OFFLINE")
+
+    total = compute = mem = 0
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            continue
+        util = int(parts[1]) if parts[1].isdigit() else 0
+        used = int(parts[2]) if parts[2].isdigit() else 0
+        total += 1
+        if util > COMPUTE_THRESHOLD:
+            compute += 1
+        if used > MEM_THRESHOLD:
+            mem += 1
+    if total == 0:
+        return (0, 0, "NO_GPU")
+    if check_trainer(ip):
+        return (total, compute, "TRAIN")
+    if compute > 0 or mem > 0:
+        return (total, compute, "USED")
+    verdict = probe_cuda_cached(ip)
+    if verdict == 1:
+        return (total, compute, "BROKEN")
+    if verdict == 2:
+        # Inconclusive (transport/environment): never IDLE — an unverified
+        # node must not be auto-occupied by try_sweep.
+        return (total, compute, "UNVERIFIED")
+    return (total, compute, "IDLE")
+
+
+# ---------------------------------------------------------------------------
+# Trainer launch / kill (launch is fully async — never blocks the UI)
+# ---------------------------------------------------------------------------
+POPENS = []   # launched Popen objects (reaped opportunistically)
+
+
+def _reap_popens():
+    for p in POPENS[:]:
+        if p.poll() is not None:
+            POPENS.remove(p)
+
+
+def _safe_thread(fn):
+    """Wrap a background-thread target: exceptions are logged to a file and
+    never printed to the terminal (a traceback would corrupt the full-screen
+    UI and look like input problems)."""
+    def wrapper(*args, **kwargs):
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                with open(LOG_FILE + ".err", "a") as fh:
+                    fh.write(f"[{time.strftime('%H:%M:%S')}] {fn.__name__}: {exc}\n")
+            except Exception:
+                pass
+    return wrapper
+
+
+@_safe_thread
+def launch_trainer(ip):
+    trainer = CONF.get("trainer", {})
+    prefix = trainer.get("command", "")
+    marker = trainer.get("marker", MARKER)
+    ws = CONF.get("paths", {}).get("workspace_root", "")
+    launcher = CONF.get("paths", {}).get("launcher_host") or os.path.join(
+        ws, "UTILS", "nodes_monitor", "run_train.sh")
+    if is_local(ip):
+        cmd = "{ %sTRAIN_TAG='%s' bash '%s'; } > %s 2>&1" % (
+            prefix, marker, launcher, LOG_FILE)
+        p = subprocess.Popen(["docker", "exec", "-d",
+                              CONF.get("env", {}).get("container", ""),
+                              "bash", "-c", cmd])
+    else:
+        remote_script = os.path.join(ws, "UTILS", "nodes_monitor", "run_train.sh")
+        inner = "%sTRAIN_TAG='%s' bash '%s'" % (prefix, marker, remote_script)
+        escaped = inner.replace("'", "'\\''")
+        cmd = "setsid bash -c '%s' > %s 2>&1 < /dev/null &" % (escaped, LOG_FILE)
+        p = subprocess.Popen(["ssh", "-f", *ssh_opts(), ip,
+                              "bash -c " + shlex.quote(cmd)])
+    POPENS.append(p)
+    _reap_popens()
+    # Tracked for exit-time cleanup. NOTE: ssh -f / docker exec -d return
+    # before the remote trainer actually exists, so _kill_launched_trainers
+    # re-checks a moment later (see there).
+    LAUNCHED.add(ip)
+
+
+def spawn_launch(ip):
+    """Launch a trainer off the UI thread and remember the thread so exit
+    cleanup can join it first (a kill racing an in-flight launch would miss
+    the trainer)."""
+    t = threading.Thread(target=launch_trainer, args=(ip,), daemon=True)
+    t.start()
+    LAUNCH_THREADS.append(t)
+
+
+def kill_trainer(ip, timeout=15):
+    return run_node(ip, f"pkill -f '{PGREP_PATTERN}'", timeout=timeout)[0]
+
+
+def _kill_launched_trainers():
+    """Best-effort, bounded: kill every trainer THIS session launched, so no
+    process is ever left on the nodes regardless of how we exit. Runs in
+    parallel threads with a global cap; stragglers die with the process."""
+    for t in list(LAUNCH_THREADS):
+        t.join(10)                     # in-flight launches finish first
+    ips = list(LAUNCHED)
+    if not ips:
+        return
+
+    def round_kill():
+        def kill_one(ip):
+            try:
+                kill_trainer(ip, timeout=6)
+            except Exception:          # never let cleanup itself fail
+                pass
+        ts = [threading.Thread(target=kill_one, args=(ip,), daemon=True)
+              for ip in ips]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(8)
+
+    round_kill()
+    # ssh -f / docker exec -d may still be spawning the trainer when the first
+    # round ran; give it a moment and kill again so none slips through.
+    time.sleep(3)
+    round_kill()
+
+
+# ---------------------------------------------------------------------------
+# Frame rendering
+# ---------------------------------------------------------------------------
+def get_cols():
+    global COLS
+    try:
+        COLS = int(subprocess.run(["tput", "cols"],
+                                  capture_output=True, text=True).stdout) or 80
+    except Exception:
+        COLS = 80
+
+
+def frame_line(s=""):
+    # Overlong content is truncated (with a trailing …) so the border can
+    # never be pushed out of alignment.
+    if vis_width(s) > FRAME_W - 4:
+        s = trunc_vis(s, FRAME_W - 4)
+    pad = FRAME_W - vis_width(s) - 2
+    if pad < 0:
+        pad = 0
+    sys.stdout.write(f"{EDGE}│{R} {s}{' ' * pad} {EDGE}│{R}\n")
+
+
+def dash_fill(n):
+    return "─" * max(0, n)
+
+
+def frame_title(s):
+    fill = FRAME_W - vis_width(s) - 3
+    if fill < 1:
+        fill = 1
+    sys.stdout.write(f"{EDGE}╭{R}─ {s} {dash_fill(fill)}{EDGE}╮{R}\n")
+
+
+def frame_bottom():
+    sys.stdout.write(f"{EDGE}╰{R}{dash_fill(FRAME_W)}{EDGE}╯{R}\n")
+
+
+def frame_prompt():
+    global PROMPT_COL
+    inner = FRAME_W - 8
+    maxlen = inner - 2
+    disp = tail_vis(INPUT, maxlen)
+    pad = inner - 2 - vis_width(disp)
+    top = dash_fill(inner - 7)
+    bot = dash_fill(inner)
+    frame_line(f"  {EDGE}╭{R}─ {BOLD}cmd{R} ─{top}{EDGE}╮{R}")
+    frame_line(f"  {EDGE}│{R} {disp}{' ' * pad} {EDGE}│{R}")
+    frame_line(f"  {EDGE}╰{R}{bot}{EDGE}╯{R}")
+    # Caret: frame border "│ " (2) + inset "  " (2) + box border "│ " (2)
+    # precede the text, so the text starts at column 7 (1-based).
+    PROMPT_COL = 7 + vis_width(disp)
+
+
+PROMPT_COL = 0
+
+
+def refresh_prompt():
+    """Redraw only the prompt's middle row (the caret's line)."""
+    inner = FRAME_W - 8
+    maxlen = inner - 2
+    disp = tail_vis(INPUT, maxlen)
+    pad = inner - 2 - vis_width(disp)
+    content = f"  {EDGE}│{R} {disp}{' ' * pad} {EDGE}│{R}"
+    fpad = FRAME_W - vis_width(content) - 2
+    if fpad < 0:
+        fpad = 0
+    sys.stdout.write("\033[G\033[2K")
+    sys.stdout.write(f"{EDGE}│{R} {content}{' ' * fpad} {EDGE}│{R}")
+    sys.stdout.write(f"\033[{7 + vis_width(disp)}G")
+    sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
+# Theme system
+# ---------------------------------------------------------------------------
+def state_color(state):
+    return {
+        "IDLE": GREEN, "TRAIN": BLUE, "USED": YELLOW,
+        "BROKEN": RED, "OFFLINE": RED, "NO_GPU": RED,
+        "UNVERIFIED": GRAY,
+    }.get(state, GRAY)
+
+
+def state_icon(state):
+    return {"IDLE": "●", "TRAIN": "▲", "USED": "◆",
+            "OFFLINE": "✖", "BROKEN": "✖", "NO_GPU": "○"}.get(state, "?")
+
+
+def node_markers(ip, state):
+    m = []
+    if state == "TRAIN":
+        m.append(f"{BOLD}{BLUE}◆ owned{R}")
+    if ip in PENDING_TRY:
+        m.append(f"{BOLD}{YELLOW}↻ try{R}")
+    if is_excluded(ip):
+        m.append(f"{GRAY}⊘ excl{R}")
+    return " ".join(m)
+
+
+def compute_cell(total, compute, state):
+    """(colored compute text, visible str) for the table cell."""
+    if state in ("checking", "UNVERIFIED", "OFFLINE", "NO_GPU", "BROKEN"):
+        return ("-", "-")
+    text = f"{compute}/{total}"
+    if state == "USED" and compute == 0:
+        return (f"{RED}{text}{R}", text)
+    return (text, text)
+
+
+def status_common():
+    pending = sorted(i + 1 for i, ip in enumerate(IPS) if ip in PENDING_TRY)
+    owned = sorted(i + 1 for i, ip in enumerate(IPS)
+                   if STATS.get(i, (0, 0, ""))[2] == "TRAIN")
+    s = f"{YELLOW}try: [{','.join(map(str, pending))}]   owned: [{','.join(map(str, owned))}]{R}"
+    if MESSAGE:
+        s += f"  {GRAY}|{R}  {MESSAGE}"
+    frame_line("  " + s)
+
+
+# ---- theme: table ----
+# Column widths: idx=3, ip=12, state=8, compute=8, marks=24. Every border
+# segment is (cell width + 2 spaces); header/data rows are produced by the
+# same pad_to calls, so the borders can never drift.
+TABLE_TOP = "╭─────┬──────────────┬──────────┬──────────┬──────────────────────────╮"
+TABLE_SEP = "├─────┼──────────────┼──────────┼──────────┼──────────────────────────┤"
+TABLE_BOT = "╰─────┴──────────────┴──────────┴──────────┴──────────────────────────╯"
+
+
+def theme_table_header():
+    frame_line(f"  {GRAY}{TABLE_TOP}{R}")
+    row = (f"  {GRAY}│{R} {pad_to(f'{BOLD}idx{R}', 3)} {GRAY}│{R} "
+           f"{pad_to(f'{BOLD}ip{R}', 12)} {GRAY}│{R} "
+           f"{pad_to(f'{BOLD}state{R}', 8)} {GRAY}│{R} "
+           f"{pad_to(f'{BOLD}compute{R}', 8)} {GRAY}│{R} "
+           f"{pad_to(f'{BOLD}marks{R}', 24)} {GRAY}│{R}")
+    frame_line(row)
+    frame_line(f"  {GRAY}{TABLE_SEP}{R}")
+
+
+def theme_table_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    ccell, _ = compute_cell(total, compute, state)
+    marks = node_markers(ip, state)
+    row = (f"  {GRAY}│{R} {pad_to(str(idx), 3)} {GRAY}│{R} "
+           f"{pad_to(ip, 12)} {GRAY}│{R} "
+           f"{pad_to(f'{sc}{state}{R}', 8)} {GRAY}│{R} "
+           f"{pad_to(ccell, 8)} {GRAY}│{R} "
+           f"{pad_to(marks, 24)} {GRAY}│{R}")
+    frame_line(row)
+
+
+def theme_table_status():
+    frame_line(f"  {GRAY}{TABLE_BOT}{R}")
+    frame_line("")
+    status_common()
+
+
+# ---- theme: icons ----
+def theme_icons_header():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+
+
+def theme_icons_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    icon = state_icon(state)
+    marks = node_markers(ip, state)
+    if state in ("checking", "OFFLINE", "NO_GPU", "BROKEN"):
+        frame_line(f"  {sc}{icon}{R} {GRAY}[{idx}]{R} {BOLD}{ip}{R}  {sc}{state}{R}  {marks}")
+    else:
+        ccell, _ = compute_cell(total, compute, state)
+        frame_line(f"  {sc}{icon}{R} {GRAY}[{idx}]{R} {BOLD}{ip}{R}  "
+                   f"{sc}{state}{R}  {ccell} gpu  {marks}")
+
+
+def theme_icons_status():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+    frame_line("")
+    status_common()
+
+
+# ---- theme: dashboard ----
+def theme_dashboard_header():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+
+
+def theme_dashboard_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    icon = state_icon(state)
+    marks = node_markers(ip, state)
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {sc}{icon}{R} {BOLD}[{idx}]{R} {BOLD}{ip}{R}  "
+               f"{sc}{state}{R}  {ccell}  {marks}")
+
+
+def theme_dashboard_status():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+    frame_line("")
+    status_common()
+
+
+# ---- theme: status ----
+def theme_status_header():
+    pass
+
+
+def theme_status_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    marks = node_markers(ip, state)
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {GRAY}[{idx}]{R} {BOLD}{ip}{R}  {sc}{state}{R}  {ccell}  {marks}")
+
+
+def theme_status_status():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+    buckets = {"TRAIN": [], "IDLE": [], "USED": [], "DOWN": []}
+    for i, ip in enumerate(IPS):
+        state = STATS.get(i, (0, 0, ""))[2]
+        if state in ("TRAIN", "IDLE", "USED"):
+            buckets[state].append(i + 1)
+        elif state in ("OFFLINE", "BROKEN", "NO_GPU", "UNVERIFIED"):
+            buckets["DOWN"].append(i + 1)
+    pend = [i + 1 for i, ip in enumerate(IPS) if ip in PENDING_TRY]
+    frame_line(f"  {GREEN}idle:[{buckets['IDLE']}]{R} {YELLOW}used:[{buckets['USED']}]{R} "
+               f"{BLUE}owned:[{buckets['TRAIN']}]{R} {RED}down:[{buckets['DOWN']}]{R} "
+               f"{YELLOW}try:[{pend}]{R}")
+    if MESSAGE:
+        frame_line("  " + MESSAGE)
+
+
+# ---- theme: neon ----
+# Colored double-line inner separators, a per-node utilization bar, and a
+# live GPU-occupancy sparkline (per-node history kept by node_worker).
+HISTORY = {}          # ip -> deque of compute/total ratios (last N fetches)
+SPARK = "▁▂▃▄▅▆▇█"     # 8-level sparkline blocks (oldest left)
+HISTORY_LEN = 24
+
+
+def _record_history(ip, total, compute):
+    if total > 0:
+        HISTORY.setdefault(ip, deque(maxlen=HISTORY_LEN)).append(compute / total)
+
+
+def util_bar(total, compute, color):
+    """8-cell occupancy bar: ██░░░░░░ — filled cells in the state color."""
+    if total <= 0:
+        return GRAY + "░" * 8 + R
+    filled = round(8 * compute / total)
+    return (color + "█" * filled + GRAY + "░" * (8 - filled) + R)
+
+
+def sparkline(ip, width):
+    # Snapshot under the lock: node_worker appends to HISTORY under
+    # STATS_LOCK, and iterating a deque that is concurrently mutated
+    # raises RuntimeError — which would crash render() and kill the TUI.
+    with STATS_LOCK:
+        h = list(HISTORY.get(ip) or ())
+    if not h:
+        return GRAY + "·" * width + R
+    s = "".join(SPARK[min(7, int(r * 7.999))] for r in h)
+    if len(s) > width:
+        s = s[-width:]
+    return CYAN + s.rjust(width, "·") + R
+
+
+def theme_neon_header():
+    frame_line(f"  {EDGE}╞{R}{'═' * 62}{EDGE}╡{R}")
+
+
+def theme_neon_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    icon = state_icon(state)
+    marks = node_markers(ip, state)
+    if state in ("checking", "OFFLINE", "NO_GPU", "BROKEN"):
+        frame_line(f"  {CYAN}◈{R} {BOLD}{idx:02d}{R} {BOLD}{ip}{R}  "
+                   f"{sc}{icon}{R} {sc}{state}{R}  {marks}")
+    else:
+        ccell, _ = compute_cell(total, compute, state)
+        frame_line(f"  {CYAN}◈{R} {BOLD}{idx:02d}{R} {BOLD}{ip}{R}  "
+                   f"{sc}{icon}{R} {sc}{state}{R}  "
+                   f"{' ' * max(0, 8 - vis_width(ccell))}{ccell}  "
+                   f"{util_bar(total, compute, sc)}  {sparkline(ip, 12)}  {marks}")
+
+
+def theme_neon_status():
+    frame_line(f"  {EDGE}╞{R}{'═' * 62}{EDGE}╡{R}")
+    frame_line("")
+    status_common()
+    # Cluster-wide occupancy summary.
+    tot = comp = 0
+    counts = {}
+    for i, ip in enumerate(IPS):
+        total, compute, state = STATS.get(i, (0, 0, "checking"))
+        tot += total
+        comp += compute
+        counts[state] = counts.get(state, 0) + 1
+    pct = (100 * comp // tot) if tot else 0
+    frame_line(f"  {GREEN}● idle {counts.get('IDLE', 0)}{R}   "
+               f"{YELLOW}◆ used {counts.get('USED', 0)}{R}   "
+               f"{BLUE}▲ owned {counts.get('TRAIN', 0)}{R}   "
+               f"{RED}✖ down {counts.get('OFFLINE', 0) + counts.get('BROKEN', 0) + counts.get('NO_GPU', 0) + counts.get('UNVERIFIED', 0)}{R}   "
+               f"{MAGENTA}▊ GPU busy {pct}%{R}")
+
+
+THEMES = {
+    "table": (theme_table_header, theme_table_node, theme_table_status, ""),
+    "icons": (theme_icons_header, theme_icons_node, theme_icons_status, ""),
+    "dashboard": (theme_dashboard_header, theme_dashboard_node, theme_dashboard_status, ""),
+    "status": (theme_status_header, theme_status_node, theme_status_status, ""),
+    "neon": (theme_neon_header, theme_neon_node, theme_neon_status, CYAN),
+}
+
+
+def render():
+    global FRAME_W, LAST_RENDER, RENDER_SIG, RENDER_MIN, EDGE
+    FRAME_W = COLS - 2
+    EDGE = THEMES[THEME][3]
+    title_color = MAGENTA if THEME == "neon" else CYAN
+    sys.stdout.write("\033[2J\033[H\033[?25l")
+    frame_title(f"{BOLD}{title_color}● nodes monitor workbench{R}  "
+                f"{GRAY}{len(IPS)} nodes  {time.strftime('%H:%M')}  theme:{THEME}{R}")
+    frame_line("")
+    header, node, status, _ = THEMES[THEME]
+    header()
+    for i, ip in enumerate(IPS):
+        node(i + 1, ip)
+    status()
+    frame_line("")
+    frame_prompt()
+    frame_bottom()
+    # caret onto the prompt's middle row, right after the input text
+    sys.stdout.write(f"\033[3A\033[{PROMPT_COL}G")
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
+    LAST_RENDER = time.time()
+    RENDER_SIG = stats_sig()
+    RENDER_MIN = time.localtime().tm_min
+
+
+def show_help():
+    sys.stdout.write("\033[2J\033[H")
+    frame_title(f"{BOLD}{CYAN}● nodes monitor workbench — commands{R}")
+    frame_line("")
+    for line in [
+        "  kill N | kill all | kill 1,2,3   kill every GPU process on the node(s)",
+        "                                   (everything nvidia-smi lists)",
+        "  train [N|1,2]                    occupy node(s) now — only when idle;",
+        "                                   non-idle nodes report FAIL(state)",
+        "  try_train [N|1,2]                arm background occupation: node(s)",
+        "                                   occupied as soon as they go idle",
+        "  release N | release all          stop try_train and kill only our",
+        "                                   tagged trainer processes",
+        "  theme NAME                       switch UI theme",
+        "                                   (table|icons|dashboard|status|neon)",
+        "  help                             show this help",
+        "  quit | exit | q                  leave the workbench (Ctrl-C / Ctrl-D too)",
+    ]:
+        frame_line(line)
+    frame_line("")
+    frame_line(f"{GRAY}node indices are 1-based positions in the node list{R}")
+    frame_line("")
+    frame_line(f"{GRAY}press any key to return{R}")
+    frame_bottom()
+    sys.stdout.flush()
+    _wait_key(60)
+
+
+def _wait_key(timeout):
+    """Block until one key (or timeout); drain all immediately-available
+    bytes so a multi-byte key sequence never leaks into the main loop.
+    Polls in small slices so a Ctrl-C / quit during help is honored within
+    ~0.2s instead of holding the main loop for the whole timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline and not QUIT:
+        r, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if r:
+            while True:
+                r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not r2:
+                    break
+                b = os.read(sys.stdin.fileno(), 1)
+                if not b:
+                    return          # stdin EOF: hand back to the main loop's EOF handling
+            return
+
+
+# ---------------------------------------------------------------------------
+# Command handling
+# ---------------------------------------------------------------------------
+def set_message(msg):
+    global MESSAGE
+    MESSAGE = msg if len(msg) <= 70 else msg[:67] + "..."
+
+
+def ip_index(ip):
+    return IPS.index(ip) + 1 if ip in IPS else 0
+
+
+def is_excluded(ip):
+    return ip in IPS and IPS.index(ip) in EXCLUDE
+
+
+def parse_targets(spec):
+    if not spec:
+        return [ip for ip in IPS if not is_excluded(ip)]
+    if spec == "all":
+        return [ip for ip in IPS if not is_excluded(ip)]
+    targets = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part.isdigit():
+            set_message(f"{RED}invalid index '{part}'{R} (expect: N | all | 1,2,3)")
+            return None
+        idx = int(part) - 1
+        if not (0 <= idx < len(IPS)):
+            set_message(f"{RED}index out of range: {part}{R} (1..{len(IPS)})")
+            return None
+        targets.append(IPS[idx])
+    return targets
+
+
+def cmd_kill(spec):
+    if not spec:
+        set_message(f"{YELLOW}usage: kill N | kill all | kill 1,2,3{R}")
+        return
+    targets = parse_targets(spec)
+    if targets is None:
+        return
+    set_message(f"{YELLOW}kill: working…{R}")
+    render()
+    ws = CONF.get("paths", {}).get("workspace_root", "")
+    script = os.path.join(ws, "UTILS", "nodes_monitor", "gpu_kill.sh")
+
+    def work():
+        try:
+            acc = []
+            for ip in targets:
+                rc, out = run_node(ip, f"bash {script}", timeout=10)
+                last = "unreachable" if rc != 0 else (out.strip().splitlines() or [""])[-1]
+                acc.append(f"{ip_index(ip)}:{last}")
+            set_message(f"kill → {' '.join(acc)}")
+        except Exception as exc:  # noqa: BLE001
+            set_message(f"{RED}kill failed: {exc}{R}")
+        global RENDER_NOW
+        RENDER_NOW = True
+
+    # Async: slow/unreachable nodes must never freeze the UI.
+    threading.Thread(target=work, daemon=True).start()
+
+
+def cmd_train(spec):
+    targets = parse_targets(spec) if spec else [ip for ip in IPS if not is_excluded(ip)]
+    if targets is None:
+        return
+    acc = []
+    for ip in targets:
+        idx = ip_index(ip)
+        state = STATS.get(idx - 1, (0, 0, ""))[2]
+        if state == "IDLE":
+            spawn_launch(ip)
+            PENDING_TRY.discard(ip)
+            acc.append(f"{idx}:started")
+        else:
+            acc.append(f"{idx}:FAIL({state})")
+    set_message(f"train → {' '.join(acc)}")
+
+
+def cmd_try_train(spec):
+    targets = parse_targets(spec) if spec else [ip for ip in IPS if not is_excluded(ip)]
+    if targets is None:
+        return
+    acc = []
+    for ip in targets:
+        idx = ip_index(ip)
+        state = STATS.get(idx - 1, (0, 0, ""))[2]
+        if ip in PENDING_TRY:
+            acc.append(f"{idx}:already-armed")
+        elif state == "TRAIN":
+            acc.append(f"{idx}:already-owned")
+        else:
+            PENDING_TRY.add(ip)
+            acc.append(f"{idx}:armed({'idle' if state == 'IDLE' else 'waiting ' + state})")
+    set_message(f"try_train → {' '.join(acc)}")
+
+
+def cmd_release(spec):
+    if not spec:
+        set_message(f"{YELLOW}usage: release N | release all{R}")
+        return
+    targets = parse_targets(spec)
+    if targets is None:
+        return
+    set_message(f"{YELLOW}release: working…{R}")
+    render()
+
+    def work():
+        try:
+            acc = []
+            for ip in targets:
+                idx = ip_index(ip)
+                state = STATS.get(idx - 1, (0, 0, ""))[2]
+                rel = ""
+                if ip in PENDING_TRY:
+                    PENDING_TRY.discard(ip)
+                    rel = "disarmed"
+                if state == "OFFLINE":
+                    rel += (" " if rel else "") + "offline"
+                else:
+                    rc = kill_trainer(ip)
+                    if rc == 0:
+                        rel += (" " if rel else "") + "killed tagged trainer"
+                    elif rc == 1:
+                        rel += (" " if rel else "") + "no tagged trainer"
+                    else:
+                        rel += (" " if rel else "") + "unreachable"
+                acc.append(f"{idx}:{rel}")
+            set_message(f"release → {' '.join(acc)}")
+        except Exception as exc:  # noqa: BLE001
+            set_message(f"{RED}release failed: {exc}{R}")
+        global RENDER_NOW
+        RENDER_NOW = True
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+def cmd_theme(spec):
+    global THEME
+    spec = spec.strip()
+    if spec in THEMES:
+        THEME = spec
+        set_message(f"theme → {THEME}")
+    elif not spec:
+        set_message(f"current theme: {THEME} (table|icons|dashboard|status|neon)")
+    else:
+        set_message(f"{RED}unknown theme '{spec}'{R} (table|icons|dashboard|status|neon)")
+
+
+def handle_command(input_text):
+    cmd, _, rest = input_text.partition(" ")
+    rest = rest.strip()
+    if cmd in ("h", "help"):
+        show_help()
+    elif cmd in ("quit", "exit", "q"):
+        cleanup()
+    elif cmd == "kill":
+        cmd_kill(rest)
+    elif cmd == "train":
+        cmd_train(rest)
+    elif cmd == "try_train":
+        cmd_try_train(rest)
+    elif cmd == "release":
+        cmd_release(rest)
+    elif cmd == "theme":
+        cmd_theme(rest)
+    elif cmd:
+        set_message(f"{RED}unknown command '{cmd}'{R} — type 'help'")
+
+
+# ---------------------------------------------------------------------------
+# Keyboard input (cbreak; read UTF-8 chars with a pending-byte buffer)
+# ---------------------------------------------------------------------------
+# Bytes read ahead but not yet consumed as a character (e.g. an ESC sequence
+# that turned out to be a lone ESC followed by a normal key) are parked here
+# so they are never lost — this is what prevents "swallowed" keystrokes.
+PENDING_IN = b""
+
+
+def read_char():
+    """Read one UTF-8 character from stdin. Never blocks on continuation
+    bytes (a partial sequence is dropped after a short deadline instead of
+    freezing the UI), and never loses bytes: lookahead stays in PENDING_IN.
+    Returns None on EOF."""
+    global PENDING_IN
+    if not PENDING_IN:
+        b0 = os.read(sys.stdin.fileno(), 1)
+        if not b0:
+            return None
+        PENDING_IN = b0
+    c = PENDING_IN[0]
+    need = 1
+    if (c & 0xE0) == 0xC0:
+        need = 2
+    elif (c & 0xF0) == 0xE0:
+        need = 3
+    elif (c & 0xF8) == 0xF0:
+        need = 4
+    if need == 1:
+        PENDING_IN = PENDING_IN[1:]
+        return chr(c)
+    deadline = time.time() + 0.05
+    while len(PENDING_IN) < need and time.time() < deadline:
+        r, _, _ = select.select([sys.stdin], [], [], 0.02)
+        if not r:
+            continue
+        try:
+            PENDING_IN += os.read(sys.stdin.fileno(), need - len(PENDING_IN))
+        except OSError:
+            break
+    if len(PENDING_IN) < need:
+        # Incomplete multi-byte sequence: drop just the lead byte; whatever
+        # arrives later is a fresh character, never swallowed.
+        PENDING_IN = PENDING_IN[1:]
+        return ""
+    buf = PENDING_IN[:need]
+    PENDING_IN = PENDING_IN[need:]
+    try:
+        return buf.decode("utf-8")
+    except UnicodeDecodeError:
+        return ""
+
+
+def handle_key(ch):
+    global INPUT, QUIT
+    if ch in ("\r", "\n"):
+        handle_command(INPUT)
+        INPUT = ""
+        render()
+    elif ch in ("\x7f", "\b"):
+        if INPUT:
+            INPUT = INPUT[:-1]
+            refresh_prompt()          # backspace: redraw (multi-byte safe)
+    elif ch in ("\x03", "\x04"):       # Ctrl-C / Ctrl-D
+        cleanup()
+    elif ch == "\x15":                 # Ctrl-U
+        INPUT = ""
+        refresh_prompt()
+    elif ch == "\x09":                 # Tab
+        pass
+    elif ch == "\x1b":                 # escape sequence
+        # The byte right after ESC is an INTRODUCER, not a final byte:
+        # '[' (CSI) -> keep draining until a final byte (0x40-0x7E);
+        # 'O' (SS3, e.g. F-keys) -> exactly one more byte.
+        # Any other byte is NOT part of a sequence (lone ESC followed by a
+        # fast keystroke) — it goes back into PENDING_IN so it is not lost.
+        global PENDING_IN
+        deadline = time.time() + 0.05
+        r, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not r:
+            return                      # lone ESC
+        b = os.read(sys.stdin.fileno(), 1)
+        if not b:
+            return
+        if b == b"[":
+            while time.time() < deadline:
+                r, _, _ = select.select([sys.stdin], [], [], 0.02)
+                if not r:
+                    continue
+                b = os.read(sys.stdin.fileno(), 1)
+                if not b:
+                    return
+                if 0x40 <= b[0] <= 0x7E:   # CSI final byte
+                    return
+        elif b == b"O":
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                os.read(sys.stdin.fileno(), 1)
+        else:
+            PENDING_IN = b + PENDING_IN   # give the byte back to read_char
+    elif 32 <= ord(ch) <= 126 or ord(ch) >= 160:
+        INPUT += ch
+        inner = FRAME_W - 8
+        maxlen = inner - 2
+        if vis_width(INPUT) <= maxlen:
+            # Not overflowing: the caret is already right after the input
+            # text, so just echo the character — zero redraw, no flicker,
+            # no per-keystroke terminal traffic (the fix for input lag on
+            # slow/SSH terminals).
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+        else:
+            refresh_prompt()          # overflow: redraw the visible tail
+
+
+# ---------------------------------------------------------------------------
+# Background state collection (one thread per node — the main thread never
+# blocks on ssh/docker; a slow or failing node never stalls the others)
+# ---------------------------------------------------------------------------
+def node_worker(i, ip):
+    while True:
+        try:
+            st = get_node_state(ip)
+        except Exception:
+            st = None          # keep last known state; never print to the UI
+        if st is not None:
+            with STATS_LOCK:
+                STATS[i] = st
+                _record_history(ip, st[0], st[1])
+        time.sleep(INTERVAL)
+
+
+def try_sweep():
+    """Auto-launch armed (try_train) nodes that went IDLE."""
+    now = time.time()
+    for ip in list(PENDING_TRY):
+        idx = ip_index(ip)
+        if idx == 0:
+            continue
+        state = STATS.get(idx - 1, (0, 0, ""))[2]
+        if state == "TRAIN":
+            PENDING_TRY.discard(ip)
+        elif state == "IDLE":
+            if now - LAST_TRY_LAUNCH.get(ip, 0) > COOLDOWN:
+                spawn_launch(ip)
+                LAST_TRY_LAUNCH[ip] = now
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+RESIZED = False      # SIGWINCH arrived: re-read COLS and redraw in main loop
+RENDER_NOW = False   # a worker finished a command: redraw in main loop
+LAST_RENDER = 0.0    # epoch of the last full render (set by render())
+RENDER_SIG = None    # STATS signature at the last render (conditional redraw)
+RENDER_MIN = -1      # minute shown in the title at the last render
+
+
+def stats_sig():
+    """Signature of the current STATS — the periodic render is skipped when
+    it is unchanged (keeps terminal traffic to a minimum on slow/remote
+    terminals like VSCode's SSH terminal, where a 2KB full redraw visibly
+    delays keystrokes)."""
+    return tuple(STATS.get(i) for i in range(len(IPS)))
+
+
+def restore_terminal():
+    global OLD_TERM
+    try:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+        if OLD_TERM is not None:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, OLD_TERM)
+    except Exception:
+        pass
+
+
+def cleanup():
+    """Request a clean shutdown. The main loop notices QUIT within ~0.2s and
+    runs the teardown (kill our trainers, restore the terminal, clear the
+    screen) in its own thread — no network I/O ever happens in a signal
+    handler."""
+    global QUIT
+    QUIT = True
+
+
+def on_signal(signum, frame):
+    cleanup()
+
+
+def on_winch(signum, frame):
+    # Just flag it; get_cols() (subprocess) and render() run in the main loop.
+    global RESIZED
+    RESIZED = True
+
+
+def on_tstp(signum, frame):
+    restore_terminal()
+    os.kill(os.getpid(), signal.SIGSTOP)
+
+
+def on_cont(signum, frame):
+    tty.setcbreak(sys.stdin.fileno())
+    render()
+
+
+def main(argv=None):
+    global THEME, OLD_TERM, RESIZED, RENDER_NOW, LAST_RENDER
+    ap = argparse.ArgumentParser(description="nodes monitor workbench")
+    ap.add_argument("--config", help="config file (default: .data override, else template)")
+    ap.add_argument("--exclude", help="skip nodes by 1-based workbench index, e.g. 1,3")
+    args = ap.parse_args(argv)
+
+    load_config(args.config)
+    load_nodes()
+
+    global PGREP_PATTERN
+    trainer = CONF.get("trainer", {})
+    marker = trainer.get("marker", MARKER)
+    if not marker:
+        sys.exit("marker must not be empty")
+    PGREP_PATTERN = trainer.get("pgrep_pattern") or ("[%s]%s" % (marker[0], marker[1:]))
+
+    if args.exclude:
+        for part in args.exclude.split(","):
+            part = part.strip()
+            if not part.isdigit() or not (1 <= int(part) <= len(IPS)):
+                sys.exit(f"invalid --exclude index: {part} (1..{len(IPS)})")
+            EXCLUDE.add(int(part) - 1)
+
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("manager.py needs an interactive terminal")
+
+    THEME = CONF.get("ui", {}).get("theme", "table")
+    if THEME not in THEMES:
+        sys.exit(f"unknown theme '{THEME}' in config (table|icons|dashboard|status|neon)")
+
+    OLD_TERM = termios.tcgetattr(sys.stdin.fileno())
+    tty.setcbreak(sys.stdin.fileno())
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGWINCH, on_winch)
+    signal.signal(signal.SIGTSTP, on_tstp)
+    signal.signal(signal.SIGCONT, on_cont)
+
+    set_message(f"{GRAY}ready — type 'help'{R}")
+    get_cols()
+
+    # One collection thread per node: a slow or failing node never blocks
+    # the UI or the other nodes (see node_worker).
+    for i, ip in enumerate(IPS):
+        threading.Thread(target=node_worker, args=(i, ip), daemon=True).start()
+
+    try:
+        render()
+        while not QUIT:
+            # PENDING_IN holds bytes that were read ahead (e.g. an ESC
+            # sequence that turned out to be a lone ESC): consume them
+            # immediately — waiting on select() would swallow the keystroke.
+            if PENDING_IN:
+                ch = read_char()
+            else:
+                r, _, _ = select.select([sys.stdin], [], [], 0.1)
+                ch = read_char() if r else ""   # "" = no input; None = EOF
+            if ch is None:      # stdin EOF (detached terminal)
+                cleanup()
+            elif ch:
+                handle_key(ch)
+            now = time.time()
+            if RESIZED:
+                RESIZED = False
+                get_cols()
+                render()
+            elif RENDER_NOW:
+                RENDER_NOW = False
+                render()
+            elif now - LAST_RENDER >= INTERVAL:
+                try_sweep()
+                # Conditional redraw: skip the full-screen repaint when
+                # nothing changed (state stable + same minute). On VSCode's
+                # SSH terminal a 2KB redraw costs real time and makes
+                # keystrokes feel laggy — so we only pay for it on change.
+                if stats_sig() != RENDER_SIG or time.localtime().tm_min != RENDER_MIN:
+                    render()
+                LAST_RENDER = now
+    finally:
+        # Whatever happens (exception, signal, EOF): never leave OUR trainers
+        # on the nodes, and never leave the terminal broken or cluttered —
+        # otherwise the user's shell swallows typed input and the last frame
+        # stays on screen.
+        try:
+            _kill_launched_trainers()
+        finally:
+            restore_terminal()
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
