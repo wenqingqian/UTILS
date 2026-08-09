@@ -122,6 +122,9 @@ C_GRAY=$'\033[90m'
 # Tuning knobs; all overridable via the [monitor] section of the config.
 INTERVAL=5
 COOLDOWN=60
+# CUDA health-probe cadence: one probe at startup, then every PROBE_INTERVAL
+# for confirmed verdicts. Inconclusive probes expire after COOLDOWN instead.
+PROBE_INTERVAL=600
 
 COMPUTE_THRESHOLD=0
 MEM_USED_THRESHOLD=100
@@ -157,6 +160,7 @@ load_config() {
             nodes_file=*)     NODES_FILE="${line#nodes_file=}"       ;;
             monitor_interval=*)  INTERVAL="${line#monitor_interval=}" ;;
             monitor_cooldown=*)  COOLDOWN="${line#monitor_cooldown=}" ;;
+            monitor_probe_interval=*) PROBE_INTERVAL="${line#monitor_probe_interval=}" ;;
             monitor_compute_threshold=*) COMPUTE_THRESHOLD="${line#monitor_compute_threshold=}" ;;
             monitor_mem_used_threshold=*) MEM_USED_THRESHOLD="${line#monitor_mem_used_threshold=}" ;;
             monitor_log_file=*) LOG_FILE="${line#monitor_log_file=}" ;;
@@ -313,6 +317,11 @@ parse_args() {
 
 is_local() {
     local ip="$1"
+    # An empty ip must never classify as local: `hostname -I` output ends
+    # with a trailing space, so " ${LOCAL_IPS} " contains a double space
+    # that a zero-length pattern would match — routing a bogus command into
+    # the LOCAL container (a spurious pkill of OTHER sessions' trainers).
+    [[ -n "${ip}" ]] || return 1
     # Quoting "${ip}" makes the dots literal instead of regex wildcards.
     [[ " ${LOCAL_IPS} " =~ [[:space:]]"${ip}"[[:space:]] ]]
 }
@@ -403,11 +412,32 @@ probe_cuda_cached() {
     mkdir -p "${PROBE_CACHE_DIR}" 2>/dev/null
     now=$(date +%s)
     cache="${PROBE_CACHE_DIR}/${ip}"
-    if [[ -f "${cache}" ]] && (( now - $(stat -c '%Y' "${cache}" 2>/dev/null || echo 0) < COOLDOWN )); then
-        local verdict
+    if [[ -f "${cache}" ]]; then
+        local verdict window
         verdict="$(<"${cache}")"
-        case "${verdict}" in 0|1|2) ;; *) verdict=1 ;; esac
-        return "${verdict}"
+        case "${verdict}" in
+            0|1|2)
+                # Confirmed verdicts (0 healthy / 1 BROKEN) stay cached for the
+                # full PROBE_INTERVAL (startup + every 10 min by default);
+                # inconclusive (2) expires after COOLDOWN so an UNVERIFIED node
+                # re-probes soon.
+                if (( verdict == 2 )); then
+                    window="${COOLDOWN}"
+                else
+                    window="${PROBE_INTERVAL}"
+                fi
+                if (( now - $(stat -c '%Y' "${cache}" 2>/dev/null || echo 0) < window )); then
+                    return "${verdict}"
+                fi
+                ;;
+            *)
+                # Empty/corrupt cache file — Ctrl-C can kill a startup probe
+                # subshell between truncate and write, leaving a zero-length
+                # file with a FRESH mtime. Treat it as a cache MISS and
+                # re-probe: never mislabel a healthy node BROKEN for a full
+                # PROBE_INTERVAL on the strength of a truncated file.
+                ;;
+        esac
     fi
 
     local verdict=1 fail_file fails
@@ -440,7 +470,10 @@ probe_cuda_cached() {
         fi
     fi
 
-    printf '%s' "${verdict}" > "${cache}" 2>/dev/null || true
+    # Atomic write (tmp + mv): an interrupted write must never leave a
+    # zero-length cache file — the read side treats such a file as a miss
+    # and re-probes, so a clean verdict always lands as one rename.
+    printf '%s' "${verdict}" > "${cache}.tmp" 2>/dev/null && mv -f "${cache}.tmp" "${cache}" 2>/dev/null || true
     return "${verdict}"
 }
 
@@ -725,6 +758,18 @@ main() {
     fi
 
     trap cleanup INT TERM EXIT
+
+    # Startup probe: one health snapshot per node, in parallel, so every node
+    # has a verdict before the first tick and the PROBE_INTERVAL cadence
+    # (10 min default) starts here. Nodes probed recently (cache fresh) are
+    # skipped — never more often than PROBE_INTERVAL per verdict.
+    local -a probe_pids=()
+    local ip
+    for ip in "${ACTIVE_IPS[@]}"; do
+        ( probe_cuda_cached "${ip}" >/dev/null 2>&1 ) &
+        probe_pids+=($!)
+    done
+    for p in "${probe_pids[@]}"; do wait "${p}" 2>/dev/null || true; done
 
     printf '\033[2J\033[H\033[s\033[?25l'
 
