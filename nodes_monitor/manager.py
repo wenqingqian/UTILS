@@ -13,7 +13,9 @@ Commands at the `cmd` prompt:
                                      as soon as a node goes idle)
     release N | release all          stop try_train and kill only our
                                      tagged trainer processes
-    theme NAME                       table | icons | dashboard | status
+    theme                            open the interactive theme picker
+    theme NAME                       table | icons | dashboard | status | neon |
+                                     matrix | graph | cards | waves | weather | mono
     help                             show this help
     quit | exit | q                  leave the workbench
 
@@ -39,7 +41,7 @@ import threading
 import unicodedata
 import termios
 import tty
-from collections import deque
+from collections import deque, defaultdict
 
 try:
     import tomllib  # python >= 3.11
@@ -61,6 +63,7 @@ BLUE = "\033[34m"
 MAGENTA = "\033[35m"
 CYAN = "\033[36m"
 GRAY = "\033[90m"
+BRIGHT_GREEN = "\033[92m"
 
 # ---------------------------------------------------------------------------
 # Config / state
@@ -88,6 +91,9 @@ PGREP_PATTERN = None  # derived from the marker in setup()
 LAUNCHED = set()        # ip -> trainer launched (kill on exit)
 LAUNCH_THREADS = []     # in-flight launch threads (join before the kill)
 EDGE = ""               # ANSI color for the frame borders (per theme)
+RESET = R               # color reset used by the frame code ("" for mono)
+FRAME_GLYPHS = ("╭", "╮", "╰", "╯", "│", "─")   # tl tr bl br vl hl
+ASCII_GLYPHS = ("+", "+", "+", "+", "|", "-")
 
 # ---------------------------------------------------------------------------
 # Width / alignment helpers (locale-independent)
@@ -146,7 +152,7 @@ def trunc_vis(s, width):
         out.append(c)
         n += w
         i += 1
-    return "".join(out) + R + "…"
+    return "".join(out) + RESET + "…"
 
 
 def tail_vis(s, width):
@@ -168,7 +174,7 @@ def tail_vis(s, width):
 # ---------------------------------------------------------------------------
 def load_config(cfg_file=None):
     global CONF, INTERVAL, COOLDOWN, COMPUTE_THRESHOLD, MEM_THRESHOLD, LOG_FILE
-    global AMBIG_WIDTH
+    global AMBIG_WIDTH, PROBE_INTERVAL
     candidates = []
     if cfg_file:
         candidates.append(cfg_file)
@@ -192,6 +198,7 @@ def load_config(cfg_file=None):
     ui = CONF.get("ui", {})
     INTERVAL = int(mon.get("interval", 5))
     COOLDOWN = int(mon.get("cooldown", 60))
+    PROBE_INTERVAL = int(mon.get("probe_interval", 600))
     COMPUTE_THRESHOLD = int(mon.get("compute_threshold", 0))
     MEM_THRESHOLD = int(mon.get("mem_used_threshold", 100))
     LOG_FILE = mon.get("log_file", "/tmp/utils_train.log")
@@ -303,25 +310,43 @@ def probe_cuda(ip):
 PROBE_TS = {}      # ip -> (epoch, verdict 0/1/2)
 PROBE_FAILS = {}   # ip -> consecutive rc=1 failures
 PROBE_FAIL_THRESHOLD = 3
+PROBE_LOCKS = defaultdict(threading.Lock)   # one probe in flight per ip
 
 
 def probe_cuda_cached(ip):
     """0 = healthy, 1 = confirmed BROKEN (PROBE_FAIL_THRESHOLD consecutive
     rc=1 failures), 2 = inconclusive (transport/environment failure — NOT a
-    GPU verdict; callers must not treat it as BROKEN)."""
+    GPU verdict; callers must not treat it as BROKEN).
+
+    Cadence: one probe at startup (the cache starts empty), then a confirmed
+    verdict (0/1) stays cached for PROBE_INTERVAL — an idle node is re-probed
+    at most once per 10 minutes (default). An inconclusive verdict (2)
+    expires after COOLDOWN instead, so an UNVERIFIED node re-probes soon
+    rather than lingering. The per-ip lock keeps concurrent callers (startup
+    round + node workers) from probing the same node twice."""
     now = time.time()
-    if ip in PROBE_TS and now - PROBE_TS[ip][0] < COOLDOWN:
-        return PROBE_TS[ip][1]
-    rc = probe_cuda(ip)
-    if rc == 0:
-        PROBE_FAILS[ip] = 0
-        verdict = 0
-    elif rc == 1:
-        PROBE_FAILS[ip] = PROBE_FAILS.get(ip, 0) + 1
-        verdict = 1 if PROBE_FAILS[ip] >= PROBE_FAIL_THRESHOLD else 2
-    else:
-        verdict = 2
-    PROBE_TS[ip] = (now, verdict)
+    if ip in PROBE_TS:
+        ts, verdict = PROBE_TS[ip]
+        window = PROBE_INTERVAL if verdict != 2 else COOLDOWN
+        if now - ts < window:
+            return verdict
+    with PROBE_LOCKS[ip]:
+        # Another thread may have probed while we waited for the lock.
+        if ip in PROBE_TS:
+            ts, verdict = PROBE_TS[ip]
+            window = PROBE_INTERVAL if verdict != 2 else COOLDOWN
+            if time.time() - ts < window:
+                return verdict
+        rc = probe_cuda(ip)
+        if rc == 0:
+            PROBE_FAILS[ip] = 0
+            verdict = 0
+        elif rc == 1:
+            PROBE_FAILS[ip] = PROBE_FAILS.get(ip, 0) + 1
+            verdict = 1 if PROBE_FAILS[ip] >= PROBE_FAIL_THRESHOLD else 2
+        else:
+            verdict = 2
+        PROBE_TS[ip] = (time.time(), verdict)
     return verdict
 
 
@@ -484,35 +509,40 @@ def frame_line(s=""):
     pad = FRAME_W - vis_width(s) - 2
     if pad < 0:
         pad = 0
-    sys.stdout.write(f"{EDGE}│{R} {s}{' ' * pad} {EDGE}│{R}\n")
+    vl = FRAME_GLYPHS[4]
+    sys.stdout.write(f"{EDGE}{vl}{RESET} {s}{' ' * pad} {EDGE}{vl}{RESET}\n")
 
 
 def dash_fill(n):
-    return "─" * max(0, n)
+    return FRAME_GLYPHS[5] * max(0, n)
 
 
 def frame_title(s):
+    tl, tr, hl = FRAME_GLYPHS[0], FRAME_GLYPHS[1], FRAME_GLYPHS[5]
     fill = FRAME_W - vis_width(s) - 3
     if fill < 1:
         fill = 1
-    sys.stdout.write(f"{EDGE}╭{R}─ {s} {dash_fill(fill)}{EDGE}╮{R}\n")
+    sys.stdout.write(f"{EDGE}{tl}{RESET}{hl} {s} {dash_fill(fill)}{EDGE}{tr}{RESET}\n")
 
 
 def frame_bottom():
-    sys.stdout.write(f"{EDGE}╰{R}{dash_fill(FRAME_W)}{EDGE}╯{R}\n")
+    bl, br = FRAME_GLYPHS[2], FRAME_GLYPHS[3]
+    sys.stdout.write(f"{EDGE}{bl}{RESET}{dash_fill(FRAME_W)}{EDGE}{br}{RESET}\n")
 
 
 def frame_prompt():
     global PROMPT_COL
+    tl, tr, bl, br, vl, hl = FRAME_GLYPHS
     inner = FRAME_W - 8
     maxlen = inner - 2
     disp = tail_vis(INPUT, maxlen)
     pad = inner - 2 - vis_width(disp)
     top = dash_fill(inner - 7)
     bot = dash_fill(inner)
-    frame_line(f"  {EDGE}╭{R}─ {BOLD}cmd{R} ─{top}{EDGE}╮{R}")
-    frame_line(f"  {EDGE}│{R} {disp}{' ' * pad} {EDGE}│{R}")
-    frame_line(f"  {EDGE}╰{R}{bot}{EDGE}╯{R}")
+    cmd_label = f"{BOLD}cmd{RESET}" if THEME != "mono" else "cmd"
+    frame_line(f"  {EDGE}{tl}{RESET}{hl} {cmd_label} {hl}{top}{EDGE}{tr}{RESET}")
+    frame_line(f"  {EDGE}{vl}{RESET} {disp}{' ' * pad} {EDGE}{vl}{RESET}")
+    frame_line(f"  {EDGE}{bl}{RESET}{bot}{EDGE}{br}{RESET}")
     # Caret: frame border "│ " (2) + inset "  " (2) + box border "│ " (2)
     # precede the text, so the text starts at column 7 (1-based).
     PROMPT_COL = 7 + vis_width(disp)
@@ -523,16 +553,17 @@ PROMPT_COL = 0
 
 def refresh_prompt():
     """Redraw only the prompt's middle row (the caret's line)."""
+    vl = FRAME_GLYPHS[4]
     inner = FRAME_W - 8
     maxlen = inner - 2
     disp = tail_vis(INPUT, maxlen)
     pad = inner - 2 - vis_width(disp)
-    content = f"  {EDGE}│{R} {disp}{' ' * pad} {EDGE}│{R}"
+    content = f"  {EDGE}{vl}{RESET} {disp}{' ' * pad} {EDGE}{vl}{RESET}"
     fpad = FRAME_W - vis_width(content) - 2
     if fpad < 0:
         fpad = 0
     sys.stdout.write("\033[G\033[2K")
-    sys.stdout.write(f"{EDGE}│{R} {content}{' ' * fpad} {EDGE}│{R}")
+    sys.stdout.write(f"{EDGE}{vl}{RESET} {content}{' ' * fpad} {EDGE}{vl}{RESET}")
     sys.stdout.write(f"\033[{7 + vis_width(disp)}G")
     sys.stdout.flush()
 
@@ -633,12 +664,9 @@ def theme_icons_node(idx, ip):
     sc = state_color(state)
     icon = state_icon(state)
     marks = node_markers(ip, state)
-    if state in ("checking", "OFFLINE", "NO_GPU", "BROKEN"):
-        frame_line(f"  {sc}{icon}{R} {GRAY}[{idx}]{R} {BOLD}{ip}{R}  {sc}{state}{R}  {marks}")
-    else:
-        ccell, _ = compute_cell(total, compute, state)
-        frame_line(f"  {sc}{icon}{R} {GRAY}[{idx}]{R} {BOLD}{ip}{R}  "
-                   f"{sc}{state}{R}  {ccell} gpu  {marks}")
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {sc}{icon}{R} {GRAY}[{idx}]{R} {BOLD}{pad_to(ip, 12)}{R}  "
+               f"{pad_to(f'{sc}{state}{R}', 10)}  {pad_to(ccell, 5)} gpu  {marks}")
 
 
 def theme_icons_status():
@@ -658,8 +686,8 @@ def theme_dashboard_node(idx, ip):
     icon = state_icon(state)
     marks = node_markers(ip, state)
     ccell, _ = compute_cell(total, compute, state)
-    frame_line(f"  {sc}{icon}{R} {BOLD}[{idx}]{R} {BOLD}{ip}{R}  "
-               f"{sc}{state}{R}  {ccell}  {marks}")
+    frame_line(f"  {sc}{icon}{R} {BOLD}[{idx}]{R} {BOLD}{pad_to(ip, 12)}{R}  "
+               f"{pad_to(f'{sc}{state}{R}', 10)}  {pad_to(ccell, 5)}  {marks}")
 
 
 def theme_dashboard_status():
@@ -678,7 +706,7 @@ def theme_status_node(idx, ip):
     sc = state_color(state)
     marks = node_markers(ip, state)
     ccell, _ = compute_cell(total, compute, state)
-    frame_line(f"  {GRAY}[{idx}]{R} {BOLD}{ip}{R}  {sc}{state}{R}  {ccell}  {marks}")
+    frame_line(f"  {GRAY}[{idx}]{R} {BOLD}{pad_to(ip, 12)}{R}  {pad_to(f'{sc}{state}{R}', 10)}  {pad_to(ccell, 5)}  {marks}")
 
 
 def theme_status_status():
@@ -742,15 +770,11 @@ def theme_neon_node(idx, ip):
     sc = state_color(state)
     icon = state_icon(state)
     marks = node_markers(ip, state)
-    if state in ("checking", "OFFLINE", "NO_GPU", "BROKEN"):
-        frame_line(f"  {CYAN}◈{R} {BOLD}{idx:02d}{R} {BOLD}{ip}{R}  "
-                   f"{sc}{icon}{R} {sc}{state}{R}  {marks}")
-    else:
-        ccell, _ = compute_cell(total, compute, state)
-        frame_line(f"  {CYAN}◈{R} {BOLD}{idx:02d}{R} {BOLD}{ip}{R}  "
-                   f"{sc}{icon}{R} {sc}{state}{R}  "
-                   f"{' ' * max(0, 8 - vis_width(ccell))}{ccell}  "
-                   f"{util_bar(total, compute, sc)}  {sparkline(ip, 12)}  {marks}")
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {CYAN}◈{R} {BOLD}{idx:02d}{R} {BOLD}{pad_to(ip, 12)}{R}  "
+               f"{sc}{icon}{R} {pad_to(f'{sc}{state}{R}', 10)}  "
+               f"{pad_to(ccell, 5)}  "
+               f"{util_bar(total, compute, sc)}  {sparkline(ip, 12)}  {marks}")
 
 
 def theme_neon_status():
@@ -773,23 +797,402 @@ def theme_neon_status():
                f"{MAGENTA}▊ GPU busy {pct}%{R}")
 
 
+# ---- theme: matrix ----
+# Green-phosphor CRT look: monochrome greens, block separators, sparkline.
+def theme_matrix_header():
+    frame_line(f"  {GREEN}{'▚' * 62}{R}")
+
+
+def theme_matrix_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    marks = node_markers(ip, state)
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {GREEN}▮{R} {BRIGHT_GREEN}[{idx:02d}]{R} {BOLD}{BRIGHT_GREEN}{pad_to(ip, 12)}{R}  "
+               f"{pad_to(f'{sc}{state}{R}', 10)}  "
+               f"{GREEN}{pad_to(ccell, 5)}{R}  {sparkline(ip, 14)}  {marks}")
+
+
+def theme_matrix_status():
+    frame_line(f"  {GREEN}{'▚' * 62}{R}")
+    frame_line("")
+    status_common()
+    counts = _state_counts()
+    frame_line(f"  {BRIGHT_GREEN}> idle:{counts['IDLE']} used:{counts['USED']} "
+               f"owned:{counts['TRAIN']} down:{counts['DOWN']}{R}")
+
+
+# ---- theme: graph ----
+# htop-style utilization bars: one bar per node, plus a cluster stacked bar.
+def _graph_bar(total, compute, color, width=30):
+    if total <= 0:
+        return GRAY + "░" * width + R
+    filled = round(width * compute / total)
+    return color + "█" * filled + GRAY + "░" * (width - filled) + R
+
+
+def theme_graph_header():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+
+
+def theme_graph_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    marks = node_markers(ip, state)
+    pct = f"{100 * compute // total:3d}%" if total > 0 else "   -"
+    frame_line(f"  {GRAY}[{idx:02d}]{R} {BOLD}{pad_to(ip, 12)}{R}  {_graph_bar(total, compute, sc)} "
+               f"{pct}  {pad_to(f'{sc}{state}{R}', 10)}  {marks}")
+
+
+def theme_graph_status():
+    frame_line(f"  {GRAY}{'─' * 62}{R}")
+    frame_line("")
+    status_common()
+    # Cluster stacked bar: one colored cell per node.
+    segs = []
+    for i, _ip in enumerate(IPS):
+        state = STATS.get(i, (0, 0, ""))[2]
+        if state in ("TRAIN", "IDLE", "USED"):
+            segs.append(state_color(state) + "█" + R)
+        elif state in ("OFFLINE", "BROKEN", "NO_GPU"):
+            segs.append(RED + "█" + R)
+        else:
+            segs.append(GRAY + "░" + R)
+    frame_line("  cluster: " + "".join(segs) +
+               f"   {GREEN}█=idle{R} {YELLOW}█=used{R} {BLUE}█=owned{R} "
+               f"{RED}█=down{R} {GRAY}░=unver{R}")
+
+
+# ---- theme: cards ----
+# Dashboard widgets: each node in its own rounded card, two per row.
+CARD_W = 46
+CARD_BUF = []
+
+
+def _chip(text):
+    """Inverse-video chip (fg/bg swapped) — renders like a filled pill."""
+    return f"\033[7m{text}\033[0m"
+
+
+def _build_card(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    icon = state_icon(state)
+    marks = node_markers(ip, state)
+    ccell, _ = compute_cell(total, compute, state)
+    title = f"{BOLD}{idx:02d}{R} {BOLD}{ip}{R}"
+    w = CARD_W
+    top = f"╭─ {title} " + "─" * max(0, w - 5 - vis_width(title)) + "╮"
+    inner = f"{sc}{icon}{R} {_chip(f'{sc}{pad_to(state, 10)}{R}')}  {pad_to(ccell, 5)}  {marks}"
+    body = f"│ {pad_to(inner, w - 4)} │"
+    bottom = f"╰{'─' * (w - 2)}╯"
+    return (top, body, bottom)
+
+
+def _emit_cards():
+    per = 2 if FRAME_W >= 106 else 1
+    while len(CARD_BUF) >= per:
+        for r in range(3):
+            frame_line("  " + "  ".join(c[r] for c in CARD_BUF[:per]))
+        del CARD_BUF[:per]
+
+
+def theme_cards_header():
+    pass
+
+
+def theme_cards_node(idx, ip):
+    CARD_BUF.append(_build_card(idx, ip))
+    _emit_cards()
+
+
+def theme_cards_status():
+    if CARD_BUF:                   # odd remainder: flush it alone
+        for r in range(3):
+            frame_line("  " + "  ".join(c[r] for c in CARD_BUF))
+        CARD_BUF.clear()
+    frame_line("")
+    status_common()
+
+
+# ---- theme: waves ----
+# Oscilloscope: block-letter banner, the wide sparkline as the star, and a
+# cluster-wide waveform in the status line.
+FONT = {
+    "N": ("█  █", "██ █", "█ ██"),
+    "O": ("█████", "█   █", "█████"),
+    "D": ("████ ", "█   █", "████ "),
+    "E": ("█████", "████ ", "█████"),
+    "S": ("█████", "█    ", "█████"),
+    "M": ("█   █", "██ ██", "█ █ █"),
+    "I": ("  █  ", "  █  ", "  █  "),
+    "T": ("█████", "  █  ", "  █  "),
+    "R": ("████ ", "█   █", "███  "),
+    " ": ("     ", "     ", "     "),
+}
+BANNER_PALETTE = [CYAN, MAGENTA, YELLOW, GREEN, BLUE]
+
+
+def _block_banner(text):
+    rows = ["", "", ""]
+    for i, ch in enumerate(text):
+        col = BANNER_PALETTE[i % len(BANNER_PALETTE)]
+        for r in range(3):
+            rows[r] += col + FONT[ch][r] + R + " "
+    return rows
+
+
+def theme_waves_header():
+    for row in _block_banner("NODES MONITOR"):
+        frame_line("  " + row)
+
+
+def theme_waves_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    icon = state_icon(state)
+    marks = node_markers(ip, state)
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {sc}{icon}{R} {BOLD}{pad_to(ip, 12)}{R}  {sparkline(ip, 24)}  "
+               f"{pad_to(f'{sc}{state}{R}', 10)}  {pad_to(ccell, 5)}  {marks}")
+
+
+def _cluster_wave(width=24):
+    """Cluster-busy waveform: per-sample averages of all per-node histories,
+    aligned from the tail (all workers sample on the same INTERVAL)."""
+    with STATS_LOCK:
+        seqs = [list(h) for h in HISTORY.values()]
+    if not seqs:
+        return GRAY + "·" * width + R
+    n = max(len(s) for s in seqs)
+    out = []
+    for k in range(n):
+        i = n - 1 - k
+        vals = [s[len(s) - 1 - i] for s in seqs if i < len(s)]
+        out.append(sum(vals) / len(vals))
+    s = "".join(SPARK[min(7, int(r * 7.999))] for r in out)
+    if len(s) > width:
+        s = s[-width:]
+    return MAGENTA + s.rjust(width, "·") + R
+
+
+def theme_waves_status():
+    frame_line(f"  {CYAN}{'~' * 62}{R}")
+    frame_line("")
+    status_common()
+    frame_line(f"  {CYAN}cluster busy{R}  {_cluster_wave()}")
+
+
+# ---- theme: weather ----
+# Emoji weather forecast. Every icon is EAW 'W' (guaranteed 2 columns), so
+# the columns never drift even if the terminal's emoji font differs.
+W_ICON = {"IDLE": "🔆", "USED": "💤", "TRAIN": "⚡", "BROKEN": "🔥",
+          "OFFLINE": "🌑", "NO_GPU": "🪫", "UNVERIFIED": "⏳", "checking": "🌐"}
+
+
+def theme_weather_header():
+    frame_line(f"  {GRAY}{'·' * 62}{R}")
+
+
+def theme_weather_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    sc = state_color(state)
+    marks = node_markers(ip, state)
+    icon = W_ICON.get(state, W_ICON["checking"])
+    ccell, _ = compute_cell(total, compute, state)
+    frame_line(f"  {icon} {GRAY}[{idx:02d}]{R} {BOLD}{pad_to(ip, 12)}{R}  {pad_to(f'{sc}{state}{R}', 10)}  {pad_to(ccell, 5)}  {marks}")
+
+
+def theme_weather_status():
+    frame_line(f"  {GRAY}{'·' * 62}{R}")
+    frame_line("")
+    status_common()
+    counts = _state_counts()
+    frame_line(f"  {W_ICON['IDLE']} {counts['IDLE']} idle   "
+               f"{W_ICON['USED']} {counts['USED']} busy   "
+               f"{W_ICON['TRAIN']} {counts['TRAIN']} owned   "
+               f"{W_ICON['BROKEN']} {counts['DOWN']} down")
+
+
+# ---- theme: mono ----
+# Pure ASCII, zero ANSI colors: renders correctly on any terminal, in logs,
+# or over `script` replay. Control sequences (clear screen, cursor) remain —
+# they are unavoidable for any full-screen TUI.
+def theme_mono_header():
+    frame_line("  +" + "-" * 62 + "+")
+
+
+def theme_mono_node(idx, ip):
+    total, compute, state = STATS.get(idx - 1, (0, 0, "checking"))
+    marks = []
+    if state == "TRAIN":
+        marks.append("[owned]")
+    if ip in PENDING_TRY:
+        marks.append("[try]")
+    if is_excluded(ip):
+        marks.append("[excl]")
+    m = " ".join(marks)
+    if state in ("checking", "UNVERIFIED", "OFFLINE", "NO_GPU", "BROKEN"):
+        ccell = "-"
+    else:
+        ccell = f"{compute}/{total}"
+    frame_line(f"  | {idx:>2}  {ip:<12} {state:<10} {ccell:<5} {m} |")
+
+
+def theme_mono_status():
+    frame_line("  +" + "-" * 62 + "+")
+    frame_line("")
+    pending = [i + 1 for i, ip in enumerate(IPS) if ip in PENDING_TRY]
+    owned = [i + 1 for i, ip in enumerate(IPS) if STATS.get(i, (0, 0, ""))[2] == "TRAIN"]
+    line = f"  try: [{','.join(map(str, pending))}]   owned: [{','.join(map(str, owned))}]"
+    if MESSAGE:
+        line += "  |  " + _ANSI_RE.sub("", MESSAGE)
+    frame_line(line)
+
+
+def _state_counts():
+    """Cluster-wide state buckets for the summary lines."""
+    counts = {"IDLE": 0, "USED": 0, "TRAIN": 0, "DOWN": 0}
+    for i, _ip in enumerate(IPS):
+        state = STATS.get(i, (0, 0, ""))[2]
+        if state in ("TRAIN", "IDLE", "USED"):
+            counts[state] += 1
+        elif state in ("OFFLINE", "BROKEN", "NO_GPU", "UNVERIFIED"):
+            counts["DOWN"] += 1
+    return counts
+
+
 THEMES = {
     "table": (theme_table_header, theme_table_node, theme_table_status, ""),
     "icons": (theme_icons_header, theme_icons_node, theme_icons_status, ""),
     "dashboard": (theme_dashboard_header, theme_dashboard_node, theme_dashboard_status, ""),
     "status": (theme_status_header, theme_status_node, theme_status_status, ""),
     "neon": (theme_neon_header, theme_neon_node, theme_neon_status, CYAN),
+    "matrix": (theme_matrix_header, theme_matrix_node, theme_matrix_status, GREEN),
+    "graph": (theme_graph_header, theme_graph_node, theme_graph_status, ""),
+    "cards": (theme_cards_header, theme_cards_node, theme_cards_status, ""),
+    "waves": (theme_waves_header, theme_waves_node, theme_waves_status, CYAN),
+    "weather": (theme_weather_header, theme_weather_node, theme_weather_status, ""),
+    "mono": (theme_mono_header, theme_mono_node, theme_mono_status, ""),
+}
+
+THEME_DESC = {
+    "table": "classic bordered table",
+    "icons": "compact icon rows",
+    "dashboard": "dense one-line nodes",
+    "status": "minimal + bucket summary",
+    "neon": "cyan frame, bars & sparkline",
+    "matrix": "green phosphor CRT",
+    "graph": "htop-style utilization bars",
+    "cards": "rounded dashboard cards",
+    "waves": "block banner + big waveform",
+    "weather": "emoji weather forecast",
+    "mono": "pure ASCII, no colors",
 }
 
 
+def theme_picker():
+    """Full-screen interactive theme selection (like help): ↑↓/j k to move,
+    Enter to apply, Esc/q to cancel. The selected theme's node row is shown
+    live below the list. The screen is painted once at entry and repainted
+    only when the selection actually changes (or after a consumed escape
+    sequence such as a focus event) — idle select timeouts just re-poll
+    stdin, so an untouched picker emits zero traffic over slow SSH links
+    (same conditional-render discipline as the main loop)."""
+    global THEME, FRAME_W
+    get_cols()
+    FRAME_W = COLS - 2
+    names = list(THEMES)
+    sel = names.index(THEME) if THEME in names else 0
+    current = THEME
+    redraw = True
+    while True:
+        if redraw:
+            sys.stdout.write("\033[2J\033[H\033[?25l")
+            framed_title("● nodes monitor workbench — theme")
+            frame_line("")
+            for i, name in enumerate(names):
+                if i == sel:
+                    row = f"  {CYAN}▸{R} " + pad_to(f"\033[7m{BOLD}{name}{R}\033[0m", 11)
+                else:
+                    row = "    " + pad_to(f"{BOLD}{name}{R}", 11)
+                if name == current:
+                    row += f"{GREEN}(current){R} "
+                row += f"{GRAY}{THEME_DESC[name]}{R}"
+                frame_line(row)
+            frame_line("")
+            # live preview: the selected theme's first node row, current data
+            idx = 1
+            ip = IPS[0] if IPS else "10.0.0.1"
+            if names[sel] == "cards":
+                CARD_BUF.clear()
+                for row in _build_card(idx, ip):
+                    frame_line("  " + row)
+            else:
+                THEMES[names[sel]][1](idx, ip)
+            frame_line("")
+            frame_line(f"{GRAY}↑↓ / j k  move    Enter  apply    Esc / q  cancel{R}")
+            frame_bottom()
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+            redraw = False
+
+        r, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if not r:
+            continue
+        ch = read_char()
+        if ch is None:               # stdin EOF
+            cleanup()
+            return
+        if ch == "\x1b":
+            k = read_escape(timeout=0.15)   # SSH can split ESC and [B across packets
+            if k == "UP":
+                sel = (sel - 1) % len(names)
+                redraw = True
+            elif k == "DOWN":
+                sel = (sel + 1) % len(names)
+                redraw = True
+            elif k is None:
+                return               # lone ESC cancels
+            else:
+                # Recognized but unmapped sequence (focus event etc.): the
+                # terminal may have changed under us (e.g. re-focused) — keep
+                # the picker open and repaint, like the old code did.
+                redraw = True
+            continue
+        if ch in ("\r", "\n"):
+            THEME = names[sel]
+            set_message(f"theme → {THEME}")
+            return
+        if ch in ("q", "Q", "\x7f"):
+            return
+        if ch in ("k", "K"):
+            sel = (sel - 1) % len(names)
+            redraw = True
+        elif ch in ("j", "J"):
+            sel = (sel + 1) % len(names)
+            redraw = True
+        # any other key is ignored: no repaint
+
+
+def framed_title(text):
+    """Title for the current theme — plain (no ANSI) for mono."""
+    if THEME == "mono":
+        frame_title(f"{text}  {len(IPS)} nodes  {time.strftime('%H:%M')}  theme:{THEME}")
+    else:
+        title_color = {"neon": MAGENTA, "matrix": BRIGHT_GREEN, "waves": MAGENTA}.get(THEME, CYAN)
+        frame_title(f"{BOLD}{title_color}{text}{R}  "
+                    f"{GRAY}{len(IPS)} nodes  {time.strftime('%H:%M')}  theme:{THEME}{R}")
+
+
 def render():
-    global FRAME_W, LAST_RENDER, RENDER_SIG, RENDER_MIN, EDGE
+    global FRAME_W, LAST_RENDER, RENDER_SIG, RENDER_MIN, EDGE, RESET, FRAME_GLYPHS
     FRAME_W = COLS - 2
     EDGE = THEMES[THEME][3]
-    title_color = MAGENTA if THEME == "neon" else CYAN
+    RESET = "" if THEME == "mono" else R
+    FRAME_GLYPHS = ASCII_GLYPHS if THEME == "mono" else ("╭", "╮", "╰", "╯", "│", "─")
     sys.stdout.write("\033[2J\033[H\033[?25l")
-    frame_title(f"{BOLD}{title_color}● nodes monitor workbench{R}  "
-                f"{GRAY}{len(IPS)} nodes  {time.strftime('%H:%M')}  theme:{THEME}{R}")
+    framed_title("● nodes monitor workbench")
     frame_line("")
     header, node, status, _ = THEMES[THEME]
     header()
@@ -810,7 +1213,7 @@ def render():
 
 def show_help():
     sys.stdout.write("\033[2J\033[H")
-    frame_title(f"{BOLD}{CYAN}● nodes monitor workbench — commands{R}")
+    framed_title("● nodes monitor workbench — commands")
     frame_line("")
     for line in [
         "  kill N | kill all | kill 1,2,3   kill every GPU process on the node(s)",
@@ -821,8 +1224,10 @@ def show_help():
         "                                   occupied as soon as they go idle",
         "  release N | release all          stop try_train and kill only our",
         "                                   tagged trainer processes",
-        "  theme NAME                       switch UI theme",
-        "                                   (table|icons|dashboard|status|neon)",
+        "  theme                             open the interactive theme picker",
+        "  theme NAME                       switch directly: table, icons, dashboard,",
+        "                                   status, neon, matrix, graph, cards,",
+        "                                   waves, weather, mono",
         "  help                             show this help",
         "  quit | exit | q                  leave the workbench (Ctrl-C / Ctrl-D too)",
     ]:
@@ -997,13 +1402,13 @@ def cmd_release(spec):
 def cmd_theme(spec):
     global THEME
     spec = spec.strip()
-    if spec in THEMES:
+    if not spec:
+        theme_picker()
+    elif spec in THEMES:
         THEME = spec
         set_message(f"theme → {THEME}")
-    elif not spec:
-        set_message(f"current theme: {THEME} (table|icons|dashboard|status|neon)")
     else:
-        set_message(f"{RED}unknown theme '{spec}'{R} (table|icons|dashboard|status|neon)")
+        set_message(f"{RED}unknown theme '{spec}'{R} — see help")
 
 
 def handle_command(input_text):
@@ -1080,6 +1485,49 @@ def read_char():
         return ""
 
 
+def read_escape(timeout=0.05):
+    """After an ESC char: consume the rest of a key sequence and return its
+    name ("UP"/"DOWN"/"LEFT"/"RIGHT") or "OTHER" for any other recognized
+    sequence (focus/mouse events etc.). Returns None ONLY for a lone ESC
+    (no introducer within `timeout`) — callers may cancel on that.
+
+    The byte right after ESC is an INTRODUCER, not a final byte: '[' (CSI)
+    is drained until a final byte (0x40-0x7E); 'O' (SS3, e.g. F-keys) takes
+    exactly one more byte. Any other byte is NOT part of a sequence (lone
+    ESC followed by a fast keystroke) — it goes back into PENDING_IN so it
+    is not lost. `timeout` is how long to wait for the introducer: the
+    input line uses a short one (typing latency), the theme picker a longer
+    one — over a slow SSH link ESC and the rest of the sequence can arrive
+    in separate packets."""
+    global PENDING_IN
+    deadline = time.time() + timeout
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not r:
+        return None                     # lone ESC
+    b = os.read(sys.stdin.fileno(), 1)
+    if not b:
+        return None
+    if b == b"[":
+        while time.time() < deadline:
+            r, _, _ = select.select([sys.stdin], [], [], 0.02)
+            if not r:
+                continue
+            b = os.read(sys.stdin.fileno(), 1)
+            if not b:
+                return None
+            if 0x40 <= b[0] <= 0x7E:   # CSI final byte
+                return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(chr(b[0]), "OTHER")
+    elif b == b"O":
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if r:
+            os.read(sys.stdin.fileno(), 1)
+        return "OTHER"
+    else:
+        PENDING_IN = b + PENDING_IN   # give the byte back to read_char
+        return None
+    return None
+
+
 def handle_key(ch):
     global INPUT, QUIT
     if ch in ("\r", "\n"):
@@ -1097,36 +1545,8 @@ def handle_key(ch):
         refresh_prompt()
     elif ch == "\x09":                 # Tab
         pass
-    elif ch == "\x1b":                 # escape sequence
-        # The byte right after ESC is an INTRODUCER, not a final byte:
-        # '[' (CSI) -> keep draining until a final byte (0x40-0x7E);
-        # 'O' (SS3, e.g. F-keys) -> exactly one more byte.
-        # Any other byte is NOT part of a sequence (lone ESC followed by a
-        # fast keystroke) — it goes back into PENDING_IN so it is not lost.
-        global PENDING_IN
-        deadline = time.time() + 0.05
-        r, _, _ = select.select([sys.stdin], [], [], 0.05)
-        if not r:
-            return                      # lone ESC
-        b = os.read(sys.stdin.fileno(), 1)
-        if not b:
-            return
-        if b == b"[":
-            while time.time() < deadline:
-                r, _, _ = select.select([sys.stdin], [], [], 0.02)
-                if not r:
-                    continue
-                b = os.read(sys.stdin.fileno(), 1)
-                if not b:
-                    return
-                if 0x40 <= b[0] <= 0x7E:   # CSI final byte
-                    return
-        elif b == b"O":
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r:
-                os.read(sys.stdin.fileno(), 1)
-        else:
-            PENDING_IN = b + PENDING_IN   # give the byte back to read_char
+    elif ch == "\x1b":                 # escape sequence (arrow keys etc.)
+        read_escape()                  # drained; the input line has no arrows
     elif 32 <= ord(ch) <= 126 or ord(ch) >= 160:
         INPUT += ch
         inner = FRAME_W - 8
@@ -1262,7 +1682,7 @@ def main(argv=None):
 
     THEME = CONF.get("ui", {}).get("theme", "table")
     if THEME not in THEMES:
-        sys.exit(f"unknown theme '{THEME}' in config (table|icons|dashboard|status|neon)")
+        sys.exit(f"unknown theme '{THEME}' in config (see 'theme' in the workbench)")
 
     OLD_TERM = termios.tcgetattr(sys.stdin.fileno())
     tty.setcbreak(sys.stdin.fileno())
@@ -1275,6 +1695,12 @@ def main(argv=None):
 
     set_message(f"{GRAY}ready — type 'help'{R}")
     get_cols()
+
+    # Startup probe: one health snapshot per node, in parallel. The verdict
+    # lands in the cache before the state workers need it, so the 10-minute
+    # re-probe cadence (PROBE_INTERVAL) starts right here.
+    for ip in IPS:
+        threading.Thread(target=probe_cuda_cached, args=(ip,), daemon=True).start()
 
     # One collection thread per node: a slow or failing node never blocks
     # the UI or the other nodes (see node_worker).
