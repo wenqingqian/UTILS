@@ -1,0 +1,66 @@
+# nodes_monitor configuration template (committed; placeholder values only, no real data).
+#
+# The real configuration lives at .data/nodes_monitor/config.toml (gitignored)
+# and takes precedence over this template. Copy this file there and fill in the
+# real values for your cluster. Parsed via embedded python (tomllib); python3 >= 3.11.
+
+[ssh]
+# Path to the SSH private key used to reach the nodes (host-side path).
+# Permissions are enforced to 0600 automatically at startup if too open.
+identity = "/path/to/cluster_ssh_key"
+port = 2222
+
+[paths]
+# In-container workspace root: the mount point of your host workspace, i.e.
+#   <workspace_root>/UTILS/nodes_monitor/... must exist inside the container.
+workspace_root = "/workspace/PROJECT"
+# Launcher script path AS VISIBLE INSIDE the container (run under docker exec
+# on the local node; the remote branch derives the same in-container path from
+# workspace_root). Defaults to <workspace_root>/UTILS/nodes_monitor/run_train.sh.
+# launcher_host = "/workspace/PROJECT/UTILS/nodes_monitor/run_train.sh"
+
+[env]
+# Name of the docker container on the local node (used via `docker exec`).
+container = "your-container-name"
+
+[trainer]
+# Marker that uniquely tags OUR trainer processes. `release` kills only
+# processes carrying this marker; `kill` kills everything nvidia-smi lists.
+marker = "__UTILS_train_job__"
+# pgrep/pkill pattern for TRAIN detection. Defaults to the marker with its
+# first character bracketed (e.g. [_]_UTILS_train_job__) so pgrep/pkill never
+# match their own command line; only set this if you need a custom pattern.
+pgrep_pattern = "[U]TILS_train_job"
+# Optional env-activation PREFIX for launching the occupancy workload, used when
+# the workload needs a specific environment. run_train.sh is ALWAYS the launcher
+# — it locates train.py relative to itself, so NO train.py path appears here.
+# The launcher injects the marker via TRAIN_TAG. Example:
+# command = "source /opt/conda/etc/profile.d/conda.sh && conda activate ENV &&"
+# Optional env-activation PREFIX for the CUDA health probe (the IDLE-vs-BROKEN
+# gate). The probe script path is derived from workspace_root, never hardcoded.
+# Set this when torch is only importable inside a conda env, e.g.
+# probe_command = "source /opt/conda/etc/profile.d/conda.sh && conda activate ENV &&"
+
+[monitor]
+# Optional tuning; the values below are the defaults.
+# interval = 5
+# cooldown = 60
+# probe_interval = 600
+#   CUDA health-probe cadence: one probe at startup, then every N seconds
+#   (default 600 = 10 min) for confirmed verdicts. Inconclusive probes are
+#   retried after `cooldown` instead.
+# compute_threshold = 0
+# mem_used_threshold = 100
+# log_file = "/tmp/utils_train.log"
+
+[ui]
+# Workbench theme: table | icons | dashboard | status | neon | matrix | graph |
+#                   cards | waves | weather | mono
+theme = "table"
+
+[nodes]
+# Either an inline list (takes precedence) ...
+# list = ["10.0.0.1", "10.0.0.2"]
+# ... or a redirect to a file with one IP per line ('#' comments allowed),
+# resolved relative to the UTILS root when not absolute.
+# file = ".data/nodes_monitor/nodes.conf"
