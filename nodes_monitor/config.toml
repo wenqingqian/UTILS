@@ -12,12 +12,14 @@ port = 2222
 
 [paths]
 # In-container workspace root: the mount point of your host workspace, i.e.
-#   <workspace_root>/UTILS/nodes_monitor/... must exist inside the container.
+#   <workspace_root>/UTILS/nodes_monitor/utils/... must exist inside the
+#   container.
 workspace_root = "/workspace/PROJECT"
 # Launcher script path AS VISIBLE INSIDE the container (run under docker exec
 # on the local node; the remote branch derives the same in-container path from
-# workspace_root). Defaults to <workspace_root>/UTILS/nodes_monitor/run_train.sh.
-# launcher_host = "/workspace/PROJECT/UTILS/nodes_monitor/run_train.sh"
+# workspace_root). Defaults to
+# <workspace_root>/UTILS/nodes_monitor/utils/run_train.sh.
+# launcher_host = "/workspace/PROJECT/UTILS/nodes_monitor/utils/run_train.sh"
 
 [env]
 # Name of the docker container on the local node (used via `docker exec`).
@@ -27,10 +29,14 @@ container = "your-container-name"
 # Marker that uniquely tags OUR trainer processes. `release` kills only
 # processes carrying this marker; `kill` kills everything nvidia-smi lists.
 marker = "__UTILS_train_job__"
-# pgrep/pkill pattern for TRAIN detection. Defaults to the marker with its
-# first character bracketed (e.g. [_]_UTILS_train_job__) so pgrep/pkill never
-# match their own command line; only set this if you need a custom pattern.
-pgrep_pattern = "[U]TILS_train_job"
+# pgrep/pkill pattern for TRAIN detection: a POSIX extended regex, used with
+# pgrep -f / pkill -f. When SET it overrides the derivation from `marker` — so
+# a user who changes only `marker` silently breaks BOTH trainer detection AND
+# the exit-cleanup pkill (trainers left running on nodes). Leave this unset:
+# the default derivation brackets the marker's first character (e.g.
+# [_]_UTILS_train_job__) so pgrep/pkill never match their own command line.
+# Only set this for a genuinely custom pattern.
+# pgrep_pattern = "[U]TILS_train_job"
 # Optional env-activation PREFIX for launching the occupancy workload, used when
 # the workload needs a specific environment. run_train.sh is ALWAYS the launcher
 # — it locates train.py relative to itself, so NO train.py path appears here.

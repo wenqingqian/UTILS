@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""nodes monitor workbench — Python implementation (replaces manager.sh).
+"""nodes monitor workbench — GUI backend for the multi-node GPU monitor.
+
+Started via `manager.sh --gui` (or directly: `python3 utils/manager/manager.py`).
+Also importable as a module: manager_cli.py builds its one-shot CLI on the
+config/node helpers below (load_config, finalize_config, load_nodes,
+run_node, get_node_state, launch_trainer, check_trainer, kill_trainer,
+is_excluded) — keep module import side-effect-free so that stays cheap.
 
 A persistent control panel for the multi-node GPU monitor:
 
-    python3 manager.py [--config FILE] [--exclude 1,3]
+    python3 utils/manager/manager.py [--config FILE] [--exclude 1,3]
 
 Commands at the `cmd` prompt:
     kill N | kill all | kill 1,2,3   kill every GPU process on the node(s)
@@ -48,7 +54,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     sys.exit("manager.py needs python3 >= 3.11 (tomllib)")
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# This file lives two levels deeper than the other tools (utils/manager/manager.py):
+# SCRIPT_DIR must climb two levels to point at nodes_monitor/ and UTILS_ROOT at
+# the repo root so the config and nodes.conf candidates below keep resolving
+# to the same paths.
+_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(_PKG_DIR))
 UTILS_ROOT = os.path.dirname(SCRIPT_DIR)
 
 # ---------------------------------------------------------------------------
@@ -84,7 +95,7 @@ OLD_TERM = None
 QUIT = False
 
 MARKER = "__UTILS_train_job__"
-PGREP_PATTERN = None  # derived from the marker in setup()
+PGREP_PATTERN = None  # derived from the marker in finalize_config()
 
 # Trainers launched by THIS session; cleanup() kills them on exit so no
 # process is ever left behind on the nodes, however we end.
@@ -172,9 +183,25 @@ def tail_vis(s, width):
 # ---------------------------------------------------------------------------
 # Config loading (same resolution order as the shell version)
 # ---------------------------------------------------------------------------
+# Keys this program understands, per section. Anything else is warned about
+# and ignored (a typo like `pgrep_patern` under [trainer] would otherwise
+# silently keep the default — the operator must notice). Keep in sync with
+# the case-statement in monitor.sh's load_config.
+_KNOWN_KEYS = {
+    "ssh": {"identity", "port"},
+    "paths": {"workspace_root", "launcher_host"},
+    "env": {"container"},
+    "trainer": {"marker", "pgrep_pattern", "command", "probe_command"},
+    "monitor": {"interval", "cooldown", "probe_interval", "compute_threshold",
+                "mem_used_threshold", "log_file"},
+    "ui": {"theme"},
+    "nodes": {"list", "file"},
+}
+
+
 def load_config(cfg_file=None):
     global CONF, INTERVAL, COOLDOWN, COMPUTE_THRESHOLD, MEM_THRESHOLD, LOG_FILE
-    global AMBIG_WIDTH, PROBE_INTERVAL
+    global PROBE_INTERVAL
     candidates = []
     if cfg_file:
         candidates.append(cfg_file)
@@ -193,7 +220,18 @@ def load_config(cfg_file=None):
     with open(path, "rb") as fh:
         CONF = tomllib.load(fh)
 
-    ssh = CONF.get("ssh", {})
+    for section, table in CONF.items():
+        known = _KNOWN_KEYS.get(section, set())
+        if isinstance(table, dict):
+            for key in table:
+                if key not in known:
+                    print(f"Warning: ignoring unknown config key: {section}.{key}",
+                          file=sys.stderr)
+        else:
+            # A bare top-level key (no section) is not part of the schema.
+            print(f"Warning: ignoring unknown config key: {section}",
+                  file=sys.stderr)
+
     mon = CONF.get("monitor", {})
     ui = CONF.get("ui", {})
     INTERVAL = int(mon.get("interval", 5))
@@ -204,11 +242,61 @@ def load_config(cfg_file=None):
     LOG_FILE = mon.get("log_file", "/tmp/utils_train.log")
 
 
+# Called after load_config (by main() and by manager_cli.py): derive
+# dependent values, enforce the required settings, and auto-fix the SSH key
+# permissions (OpenSSH refuses keys readable by others). Mirrors
+# finalize_config in monitor.sh.
+def finalize_config():
+    global PGREP_PATTERN
+    ws = CONF.get("paths", {}).get("workspace_root", "")
+    identity = CONF.get("ssh", {}).get("identity", "")
+    container = CONF.get("env", {}).get("container", "")
+    if not ws:
+        sys.exit("Error: [paths] workspace_root is required")
+    if not identity:
+        sys.exit("Error: [ssh] identity is required")
+    if not container:
+        sys.exit("Error: [env] container is required")
+
+    if not os.path.isfile(identity):
+        sys.exit(f"Error: [ssh] identity file not found: {identity}")
+    # Auto-fix SSH private key permissions: OpenSSH ignores keys that are
+    # group/world-readable. Tighten to 600 if too open so auth does not fail.
+    if os.stat(identity).st_mode & 0o077:
+        try:
+            os.chmod(identity, 0o600)
+        except OSError:
+            # Warn but do not die: the fs may be read-only / root-squashed.
+            print(f"Warning: could not chmod 600 {identity} (read-only fs / "
+                  f"root-squash?); OpenSSH may refuse the key", file=sys.stderr)
+
+    # Keep the pgrep/pkill pattern in sync with the marker: derive it from
+    # the marker when the config does not set it. The [X]first-char bracket
+    # trick stops pgrep/pkill from matching their own command line.
+    trainer = CONF.get("trainer", {})
+    marker = trainer.get("marker", MARKER)
+    if not marker:
+        sys.exit("Error: [trainer] marker must not be empty")
+    PGREP_PATTERN = trainer.get("pgrep_pattern") or ("[%s]%s" % (marker[0], marker[1:]))
+
+
+# Same regex as monitor.sh's IP_RE — keep the two in sync.
+_IP_RE = re.compile(
+    r"^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+    r"(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$")
+
+
 def load_nodes():
     global IPS
     nodes = CONF.get("nodes", {})
     if nodes.get("list"):
-        IPS = list(nodes["list"])
+        IPS = []
+        for ip in nodes["list"]:
+            # A typo (or a non-string TOML value) must die loudly here, not
+            # as a cryptic ssh failure against a bogus address later.
+            if not isinstance(ip, str) or not _IP_RE.fullmatch(ip):
+                sys.exit(f"Error: invalid IP '{ip}' in [nodes] list")
+            IPS.append(ip)
     else:
         f = nodes.get("file") or os.path.join(SCRIPT_DIR, "nodes.conf")
         if not f.startswith("/"):
@@ -219,6 +307,9 @@ def load_nodes():
                 IPS = [ln for ln in IPS if ln]
         except OSError as exc:
             sys.exit(f"Error: node list file not readable: {f} ({exc})")
+        for ip in IPS:
+            if not _IP_RE.fullmatch(ip):
+                sys.exit(f"Error: invalid IP '{ip}' in {f}")
     if not IPS:
         sys.exit("Error: no nodes configured ([nodes] list or file)")
 
@@ -303,8 +394,9 @@ def check_trainer(ip):
 def probe_cuda(ip):
     prefix = CONF.get("trainer", {}).get("probe_command", "")
     ws = CONF.get("paths", {}).get("workspace_root", "")
-    probe = os.path.join(ws, "UTILS", "nodes_monitor", "cuda_probe.py")
-    return run_node(ip, f"{prefix}python3 {probe}")[0]
+    probe = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "cuda_probe.py")
+    # shlex.quote: workspace_root (hence the probe path) may contain spaces.
+    return run_node(ip, f"{prefix}python3 {shlex.quote(probe)}")[0]
 
 
 PROBE_TS = {}      # ip -> (epoch, verdict 0/1/2)
@@ -424,18 +516,23 @@ def launch_trainer(ip):
     marker = trainer.get("marker", MARKER)
     ws = CONF.get("paths", {}).get("workspace_root", "")
     launcher = CONF.get("paths", {}).get("launcher_host") or os.path.join(
-        ws, "UTILS", "nodes_monitor", "run_train.sh")
+        ws, "UTILS", "nodes_monitor", "utils", "run_train.sh")
     if is_local(ip):
-        cmd = "{ %sTRAIN_TAG='%s' bash '%s'; } > %s 2>&1" % (
-            prefix, marker, launcher, LOG_FILE)
+        # shlex.quote the paths: workspace_root (hence the launcher path) and
+        # LOG_FILE may contain spaces, which would otherwise split into
+        # separate words on the node-side shell.
+        cmd = "{ %sTRAIN_TAG='%s' bash %s; } > %s 2>&1" % (
+            prefix, marker, shlex.quote(launcher), shlex.quote(LOG_FILE))
         p = subprocess.Popen(["docker", "exec", "-d",
                               CONF.get("env", {}).get("container", ""),
                               "bash", "-c", cmd])
     else:
-        remote_script = os.path.join(ws, "UTILS", "nodes_monitor", "run_train.sh")
-        inner = "%sTRAIN_TAG='%s' bash '%s'" % (prefix, marker, remote_script)
+        remote_script = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "run_train.sh")
+        # Same quoting as above; the quotes shlex.quote adds are single
+        # quotes, which the `escaped` rewrite below already survives.
+        inner = "%sTRAIN_TAG='%s' bash %s" % (prefix, marker, shlex.quote(remote_script))
         escaped = inner.replace("'", "'\\''")
-        cmd = "setsid bash -c '%s' > %s 2>&1 < /dev/null &" % (escaped, LOG_FILE)
+        cmd = "setsid bash -c '%s' > %s 2>&1 < /dev/null &" % (escaped, shlex.quote(LOG_FILE))
         p = subprocess.Popen(["ssh", "-f", *ssh_opts(), ip,
                               "bash -c " + shlex.quote(cmd)])
     POPENS.append(p)
@@ -1265,7 +1362,25 @@ def _wait_key(timeout):
 # ---------------------------------------------------------------------------
 def set_message(msg):
     global MESSAGE
-    MESSAGE = msg if len(msg) <= 70 else msg[:67] + "..."
+    # len() counts ANSI escapes, so a colored message would be cut far short
+    # of 70 READABLE chars — measure and cut visible chars only, never
+    # slicing through an escape sequence.
+    if len(_ANSI_RE.sub("", msg)) <= 70:
+        MESSAGE = msg
+        return
+    out = []
+    n = 0
+    i = 0
+    while i < len(msg) and n < 67:
+        m = _ANSI_RE.match(msg, i)
+        if m:
+            out.append(m.group(0))      # ANSI codes ride along for free
+            i = m.end()
+        else:
+            out.append(msg[i])
+            n += 1
+            i += 1
+    MESSAGE = "".join(out) + R + "..."  # R: don't bleed a cut color onward
 
 
 def ip_index(ip):
@@ -1305,13 +1420,13 @@ def cmd_kill(spec):
     set_message(f"{YELLOW}kill: working…{R}")
     render()
     ws = CONF.get("paths", {}).get("workspace_root", "")
-    script = os.path.join(ws, "UTILS", "nodes_monitor", "gpu_kill.sh")
+    script = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
 
     def work():
         try:
             acc = []
             for ip in targets:
-                rc, out = run_node(ip, f"bash {script}", timeout=10)
+                rc, out = run_node(ip, f"bash {shlex.quote(script)}", timeout=10)
                 last = "unreachable" if rc != 0 else (out.strip().splitlines() or [""])[-1]
                 acc.append(f"{ip_index(ip)}:{last}")
             set_message(f"kill → {' '.join(acc)}")
@@ -1485,7 +1600,7 @@ def read_char():
         return ""
 
 
-def read_escape(timeout=0.05):
+def read_escape(timeout=0.15):
     """After an ESC char: consume the rest of a key sequence and return its
     name ("UP"/"DOWN"/"LEFT"/"RIGHT") or "OTHER" for any other recognized
     sequence (focus/mouse events etc.). Returns None ONLY for a lone ESC
@@ -1496,9 +1611,10 @@ def read_escape(timeout=0.05):
     exactly one more byte. Any other byte is NOT part of a sequence (lone
     ESC followed by a fast keystroke) — it goes back into PENDING_IN so it
     is not lost. `timeout` is how long to wait for the introducer: the
-    input line uses a short one (typing latency), the theme picker a longer
-    one — over a slow SSH link ESC and the rest of the sequence can arrive
-    in separate packets."""
+    input line now tolerates split sequences like the theme picker does —
+    over a slow SSH link ESC and the rest of the sequence can arrive in
+    separate packets, and the old 0.05s input-line timeout leaked the
+    leftover bytes (e.g. the "[A" of an Up arrow) into the command line."""
     global PENDING_IN
     deadline = time.time() + timeout
     r, _, _ = select.select([sys.stdin], [], [], timeout)
@@ -1661,14 +1777,8 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     load_config(args.config)
+    finalize_config()
     load_nodes()
-
-    global PGREP_PATTERN
-    trainer = CONF.get("trainer", {})
-    marker = trainer.get("marker", MARKER)
-    if not marker:
-        sys.exit("marker must not be empty")
-    PGREP_PATTERN = trainer.get("pgrep_pattern") or ("[%s]%s" % (marker[0], marker[1:]))
 
     if args.exclude:
         for part in args.exclude.split(","):

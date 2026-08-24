@@ -8,6 +8,8 @@
 #   TRAIN_PY       : path to the workload script (default: train.py next to
 #                    this script, i.e. this directory's occupancy simulator).
 #   TRAIN_TAG      : process tag             (default: __UTILS_train_job__).
+#   TRAIN_ALLOC_GIB: per-GPU allocation target in GiB (default: 30.5); read by
+#                    train.py straight from the environment, no handling here.
 
 set -euo pipefail
 
