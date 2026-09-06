@@ -37,6 +37,7 @@ VIEW_NUM="all"      # --num cap (positive integer) or "all"
 VIEW_HOSTFILE=""    # --hostfile target path (empty: none)
 VIEW_CONFIG=""      # --config FILE; handed to CONFIG_FILE after sourcing
 VIEW_TMP=""         # mktemp -d dir with per-node state files (EXIT trap cleans)
+VIEW_PIDS=()        # fetch subshell pids in flight (EXIT trap kills strays)
 
 view_usage() {
     cat <<'EOF'
@@ -126,20 +127,28 @@ view_parse_args "$@"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Shared plumbing: load_config/finalize_config/load_nodes, get_node_state,
-# INTERVAL/COOLDOWN, ... Sourcing runs nothing (BASH_SOURCE guard at the
-# bottom) and does not change the caller's set flags. It also re-derives
-# SCRIPT_DIR itself — to .../nodes_monitor/utils, NOT the directory view.sh
-# lives in — so nothing below this line may use SCRIPT_DIR.
+# INTERVAL, probe-cache windows, ... Sourcing runs nothing (the BASH_SOURCE
+# guard at the bottom) and does not change the caller's set flags. It also
+# re-derives SCRIPT_DIR itself — to .../nodes_monitor/utils, NOT the
+# directory view.sh lives in — so nothing below this line may use SCRIPT_DIR.
 source "${SCRIPT_DIR}/utils/monitor.sh"
 
 # utils/monitor.sh's top level initializes CONFIG_FILE=""; hand our --config
 # over only now — load_config honors a pre-set CONFIG_FILE.
 CONFIG_FILE="${VIEW_CONFIG}"
 
-# EXIT trap: drop the per-node state files. The guard keeps the (never armed
-# before this point) early error paths cheap; 2>/dev/null + || true because a
-# cleanup failure must never mask the real exit status.
+# EXIT trap: kill fetch subshells still in flight, then drop the per-node
+# state files. On a normal exit every pid has already been waited on (the
+# kills are no-ops); when an outside SIGTERM tears the shell down mid-round,
+# the still-running subshells would otherwise be orphaned together with
+# their ssh/nvidia-smi children. TERM to the subshell suffices — its
+# timeout-wrapped grandchild is bounded by RUN_NODE_TIMEOUT regardless.
+# 2>/dev/null + || true because a cleanup failure must never mask the real
+# exit status.
 view_cleanup() {
+    for p in ${VIEW_PIDS[@]+"${VIEW_PIDS[@]}"}; do
+        kill -TERM "${p}" 2>/dev/null || true
+    done
     [[ -n "${VIEW_TMP}" ]] && rm -rf "${VIEW_TMP}" 2>/dev/null || true
 }
 
@@ -158,13 +167,16 @@ view_fetch_one() {
 # .tmp + mv so a present file always holds a complete line — the read side
 # never sees a half-written file, and a missing file means the fetch died.
 view_collect_states() {
-    local -a pids=()
+    VIEW_PIDS=()
     local i p
     for i in "${!IPS[@]}"; do
         ( view_fetch_one "${IPS[$i]}" > "${VIEW_TMP}/${i}.tmp" && mv "${VIEW_TMP}/${i}.tmp" "${VIEW_TMP}/${i}" ) &
-        pids+=($!)
+        VIEW_PIDS+=($!)
     done
-    for p in "${pids[@]}"; do wait "${p}" 2>/dev/null || true; done
+    for p in "${VIEW_PIDS[@]}"; do wait "${p}" 2>/dev/null || true; done
+    # All fetched: empty the list so the EXIT trap has nothing to kill (a
+    # waited pid could in principle be recycled between here and the trap).
+    VIEW_PIDS=()
 }
 
 view_main() {

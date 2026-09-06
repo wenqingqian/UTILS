@@ -133,10 +133,16 @@ CUDA_PROBE=""
 
 # Tuning knobs; all overridable via the [monitor] section of the config.
 INTERVAL=5
-COOLDOWN=60
-# CUDA health-probe cadence: confirmed verdicts are re-probed every
-# PROBE_INTERVAL. Inconclusive probes expire after COOLDOWN instead.
-PROBE_INTERVAL=600
+# Trust window for cached CUDA-probe verdicts. The probe occupies GPU memory
+# while it runs (a CUDA context per GPU, visible in nvidia-smi), so it must
+# not fire casually: within COOLDOWN an earlier verdict is reused verbatim.
+# Default 12h.
+COOLDOWN=43200
+# Inconclusive (2) verdicts expire after PROBE_RETRY instead — re-probing
+# them touches no GPU (their failures happen at the transport/environment
+# layer), and this cadence also paces BROKEN confirmation
+# (PROBE_FAIL_THRESHOLD consecutive rc=1 failures, ~3 min apart by default).
+PROBE_RETRY=60
 
 COMPUTE_THRESHOLD=0
 MEM_USED_THRESHOLD=100
@@ -177,7 +183,6 @@ load_config() {
             nodes_file=*)     NODES_FILE="${line#nodes_file=}"       ;;
             monitor_interval=*)  INTERVAL="${line#monitor_interval=}" ;;
             monitor_cooldown=*)  COOLDOWN="${line#monitor_cooldown=}" ;;
-            monitor_probe_interval=*) PROBE_INTERVAL="${line#monitor_probe_interval=}" ;;
             monitor_compute_threshold=*) COMPUTE_THRESHOLD="${line#monitor_compute_threshold=}" ;;
             monitor_mem_used_threshold=*) MEM_USED_THRESHOLD="${line#monitor_mem_used_threshold=}" ;;
             monitor_log_file=*) LOG_FILE="${line#monitor_log_file=}" ;;
@@ -309,15 +314,23 @@ remote_bash_cmd() {
     printf 'bash -c %q' "$1"
 }
 
+# Command timeout for every node contact: a wedged node (nvidia-smi hung on
+# a stuck driver) must delay a query by seconds, not forever — and the
+# timeout also bounds how long an interrupted view.sh's children can linger.
+# Matches the python manager's run_node timeout. -k 5: a client that ignores
+# TERM is KILLed 5s later; exit 124 is just another transport failure to the
+# callers.
+RUN_NODE_TIMEOUT=30
+
 # Run a command inside the target environment (local docker / remote SSH).
 run_node() {
     local ip="$1"
     local cmd="$2"
 
     if is_local "${ip}"; then
-        docker exec "${CONTAINER}" bash -c "${cmd}"
+        timeout -k 5 "${RUN_NODE_TIMEOUT}" docker exec "${CONTAINER}" bash -c "${cmd}"
     else
-        ssh "${SSH_OPTS[@]}" "${ip}" "$(remote_bash_cmd "${cmd}")"
+        timeout -k 5 "${RUN_NODE_TIMEOUT}" ssh "${SSH_OPTS[@]}" "${ip}" "$(remote_bash_cmd "${cmd}")"
     fi
 }
 
@@ -336,11 +349,13 @@ fetch_gpu_data() {
     return "${rc}"
 }
 
-# Per-IP CUDA-probe verdicts, cached in FILES so an IDLE node is re-probed at
-# most once per COOLDOWN instead of re-importing torch over ssh on every
-# query. Files (not shell variables) are used because view.sh fetches node
-# state in background subshells, where variable mutations are lost; the mtime
-# check makes stale files self-expiring after COOLDOWN.
+# Per-IP CUDA-probe verdicts, cached in FILES so a view.sh call reuses the
+# verdict of an earlier call instead of re-importing torch over ssh. The
+# probe occupies GPU memory while it runs, so each view.sh run measures at
+# most once per node — at its own startup, and only when no verdict written
+# within the last COOLDOWN is on file. Files (not shell variables) are used
+# because view.sh fetches node state in background subshells, where variable
+# mutations are lost; the mtime check makes stale files self-expiring.
 #
 # Verdicts: 0 = healthy, 1 = GPU probe failed PROBE_FAIL_THRESHOLD times in a
 # row (confirmed BROKEN), 2 = transient/environment failure — NOT treated as
@@ -369,13 +384,15 @@ probe_cuda_cached() {
         verdict="$(<"${cache}")"
         case "${verdict}" in
             0|1|2)
-                # Confirmed verdicts (0 healthy / 1 BROKEN) stay cached for the
-                # full PROBE_INTERVAL (10 min by default); inconclusive (2)
-                # expires after COOLDOWN so an UNVERIFIED node re-probes soon.
+                # Confirmed verdicts (0 healthy / 1 BROKEN) stay trusted for
+                # the full COOLDOWN (12h by default); inconclusive (2)
+                # expires after PROBE_RETRY so an UNVERIFIED node re-probes
+                # soon (that retry touches no GPU — failures happen before
+                # the probe reaches CUDA).
                 if (( verdict == 2 )); then
-                    window="${COOLDOWN}"
+                    window="${PROBE_RETRY}"
                 else
-                    window="${PROBE_INTERVAL}"
+                    window="${COOLDOWN}"
                 fi
                 if (( now - $(stat -c '%Y' "${cache}" 2>/dev/null || echo 0) < window )); then
                     return "${verdict}"
@@ -385,7 +402,7 @@ probe_cuda_cached() {
                 # Empty/corrupt cache file — Ctrl-C can kill a probe subshell
                 # between truncate and write, leaving a zero-length file with
                 # a FRESH mtime. Treat it as a cache MISS and re-probe: never
-                # mislabel a healthy node BROKEN for a full PROBE_INTERVAL on
+                # mislabel a healthy node BROKEN for a full COOLDOWN on
                 # the strength of a truncated file.
                 ;;
         esac
@@ -400,7 +417,7 @@ probe_cuda_cached() {
         local rc=$?
         if (( rc == 1 )); then
             # The probe script itself ran and reported a GPU problem; only
-            # PROBE_FAIL_THRESHOLD consecutive failures (one per COOLDOWN)
+            # PROBE_FAIL_THRESHOLD consecutive failures (one per PROBE_RETRY)
             # confirm BROKEN. Anything below that is a fluke.
             if [[ -f "${fail_file}" ]]; then
                 fails="$(<"${fail_file}")"

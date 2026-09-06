@@ -50,11 +50,15 @@ marker = "__UTILS_train_job__"
 [monitor]
 # Optional tuning; the values below are the defaults.
 # interval = 5
-# cooldown = 60
-# probe_interval = 600
-#   CUDA health-probe cadence: one probe at startup, then every N seconds
-#   (default 600 = 10 min) for confirmed verdicts. Inconclusive probes are
-#   retried after `cooldown` instead.
+# cooldown = 43200
+#   Trust window for cached CUDA-probe verdicts. The probe occupies GPU
+#   memory while it runs (a CUDA context per GPU, visible in nvidia-smi), so
+#   it must not fire casually: the manager probes once at startup and never
+#   re-probes confirmed verdicts, and view.sh reuses a verdict written within
+#   `cooldown` verbatim. Inconclusive probes (transport/environment failures
+#   — they touch no GPU) are retried every 60 s regardless of this value.
+#   To force a fresh verdict for one node, delete its cache file:
+#   ${TMPDIR:-/tmp}/utils_monitor_probe-<uid>/<ip>
 # compute_threshold = 0
 # mem_used_threshold = 100
 # log_file = "/tmp/utils_train.log"
