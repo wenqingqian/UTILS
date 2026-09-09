@@ -70,7 +70,8 @@ theme = "table"
 
 [nodes]
 # Either an inline list (takes precedence) ...
-# list = ["10.0.0.1", "10.0.0.2"]
-# ... or a redirect to a file with one IP per line ('#' comments allowed),
-# resolved relative to the UTILS root when not absolute.
+# list = ["10.0.0.1", "10.0.0.2:2200"]
+# ... or a redirect to a file with one IP[:port] per line ('#' comments allowed),
+# resolved relative to the UTILS root when not absolute. A per-node :port
+# overrides [ssh].port for that node.
 # file = ".data/nodes_monitor/nodes.conf"

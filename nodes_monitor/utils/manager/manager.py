@@ -302,6 +302,32 @@ def finalize_config():
 _IP_RE = re.compile(
     r"^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
     r"(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$")
+_NODE_RE = re.compile(
+    r"^((?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])"
+    r"(?:\.(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})"
+    r"(?::([1-9][0-9]{0,4}))?$")
+
+
+def parse_node(spec):
+    if not isinstance(spec, str):
+        return None
+    m = _NODE_RE.fullmatch(spec)
+    if not m:
+        return None
+    port = int(m.group(2)) if m.group(2) else int(CONF.get("ssh", {}).get("port", 2222))
+    if port > 65535:
+        return None
+    return m.group(1), port
+
+
+def node_host(spec):
+    parsed = parse_node(spec)
+    return parsed[0] if parsed else spec.split(":", 1)[0]
+
+
+def node_port(spec):
+    parsed = parse_node(spec)
+    return parsed[1] if parsed else int(CONF.get("ssh", {}).get("port", 2222))
 
 
 def load_nodes():
@@ -312,8 +338,9 @@ def load_nodes():
         for ip in nodes["list"]:
             # A typo (or a non-string TOML value) must die loudly here, not
             # as a cryptic ssh failure against a bogus address later.
-            if not isinstance(ip, str) or not _IP_RE.fullmatch(ip):
-                sys.exit(f"Error: invalid IP '{ip}' in [nodes] list")
+            parsed = parse_node(ip)
+            if parsed is None:
+                sys.exit(f"Error: invalid node '{ip}' in [nodes] list (expected IP or IP:port)")
             IPS.append(ip)
     else:
         f = nodes.get("file") or os.path.join(SCRIPT_DIR, "nodes.conf")
@@ -326,8 +353,8 @@ def load_nodes():
         except OSError as exc:
             sys.exit(f"Error: node list file not readable: {f} ({exc})")
         for ip in IPS:
-            if not _IP_RE.fullmatch(ip):
-                sys.exit(f"Error: invalid IP '{ip}' in {f}")
+            if parse_node(ip) is None:
+                sys.exit(f"Error: invalid node '{ip}' in {f} (expected IP or IP:port)")
     if not IPS:
         sys.exit("Error: no nodes configured ([nodes] list or file)")
 
@@ -348,13 +375,13 @@ LOCAL_IPS = local_ips()
 
 
 def is_local(ip):
-    return ip in LOCAL_IPS
+    return node_host(ip) in LOCAL_IPS
 
 
-def ssh_opts():
+def ssh_opts(ip=None):
     ssh = CONF.get("ssh", {})
     opts = [
-        "-p", str(ssh.get("port", 2222)),
+        "-p", str(node_port(ip) if ip else ssh.get("port", 2222)),
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=5",
@@ -381,7 +408,7 @@ def run_node(ip, cmd, timeout=30):
             return (127, "")
         return (p.returncode, p.stdout.decode("utf-8", "replace"))
     try:
-        p = subprocess.run(["ssh", *ssh_opts(), ip, "bash -c " + shlex.quote(cmd)],
+        p = subprocess.run(["ssh", *ssh_opts(ip), node_host(ip), "bash -c " + shlex.quote(cmd)],
                            capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return (124, "")
@@ -559,7 +586,7 @@ def launch_trainer(ip):
         inner = "%sTRAIN_TAG='%s' bash %s" % (prefix, marker, shlex.quote(remote_script))
         escaped = inner.replace("'", "'\\''")
         cmd = "setsid bash -c '%s' > %s 2>&1 < /dev/null &" % (escaped, shlex.quote(LOG_FILE))
-        p = subprocess.Popen(["ssh", "-f", *ssh_opts(), ip,
+        p = subprocess.Popen(["ssh", "-f", *ssh_opts(ip), node_host(ip),
                               "bash -c " + shlex.quote(cmd)])
     POPENS.append(p)
     _reap_popens()

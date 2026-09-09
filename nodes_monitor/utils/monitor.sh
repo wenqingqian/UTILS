@@ -119,8 +119,11 @@ THEME="table"
 NODES_FILE=""
 NODES_INLINE=()
 
-IPS=()
+IPS=()                 # node specs as configured: ip or ip:port
+NODE_HOSTS=()          # bare IP for transport/locality checks
+NODE_PORTS=()          # per-node port; 0 means use SSH_PORT
 IP_RE='^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$'
+NODE_RE='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})(:([1-9][0-9]{0,4}))?$'
 SSH_OPTS=()
 
 # Node-side CUDA probe (in-container path, derived from workspace_root by
@@ -250,15 +253,22 @@ finalize_config() {
 # Read the node list into ${IPS}: inline [nodes] list wins, else [nodes] file.
 load_nodes() {
     IPS=()
-    local n=0 ip line
+    NODE_HOSTS=()
+    NODE_PORTS=()
+    local n=0 spec host port line
 
     if (( ${#NODES_INLINE[@]} > 0 )); then
-        for ip in "${NODES_INLINE[@]}"; do
-            if [[ ! "${ip}" =~ ${IP_RE} ]]; then
-                echo "Error: invalid IP '${ip}' in [nodes] list" >&2
+        for spec in "${NODES_INLINE[@]}"; do
+            if [[ ! "${spec}" =~ ${NODE_RE} ]]; then
+                echo "Error: invalid node '${spec}' in [nodes] list (expected IP or IP:port)" >&2
                 exit 1
             fi
-            IPS+=("${ip}")
+            host="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[5]:-0}"
+            (( port == 0 || port <= 65535 )) || { echo "Error: invalid port in node '${spec}'" >&2; exit 1; }
+            IPS+=("${spec}")
+            NODE_HOSTS+=("${host}")
+            NODE_PORTS+=("${port}")
             n=$((n + 1))
         done
     else
@@ -271,13 +281,18 @@ load_nodes() {
         fi
         while IFS= read -r line || [[ -n "${line}" ]]; do
             line="${line%%#*}"
-            ip="$(trim "${line}")"
-            [[ -n "${ip}" ]] || continue
-            if [[ ! "${ip}" =~ ${IP_RE} ]]; then
-                echo "Error: invalid IP '${ip}' in ${file}" >&2
+            spec="$(trim "${line}")"
+            [[ -n "${spec}" ]] || continue
+            if [[ ! "${spec}" =~ ${NODE_RE} ]]; then
+                echo "Error: invalid node '${spec}' in ${file} (expected IP or IP:port)" >&2
                 exit 1
             fi
-            IPS+=("${ip}")
+            host="${BASH_REMATCH[1]}"
+            port="${BASH_REMATCH[5]:-0}"
+            (( port == 0 || port <= 65535 )) || { echo "Error: invalid port in node '${spec}'" >&2; exit 1; }
+            IPS+=("${spec}")
+            NODE_HOSTS+=("${host}")
+            NODE_PORTS+=("${port}")
             n=$((n + 1))
         done < "${file}"
     fi
@@ -295,14 +310,26 @@ trim() {
     printf '%s' "${v}"
 }
 
+node_host() {
+    local spec="$1"
+    if [[ "${spec}" =~ ${NODE_RE} ]]; then printf '%s' "${BASH_REMATCH[1]}"; else printf '%s' "${spec%%:*}"; fi
+}
+
+node_port() {
+    local spec="$1"
+    if [[ "${spec}" =~ ${NODE_RE} ]]; then
+        local port="${BASH_REMATCH[5]:-0}"
+        (( port <= 65535 )) || { printf '%s' "${SSH_PORT}"; return; }
+        printf '%s' "${port}"
+    else
+        printf '%s' "${SSH_PORT}"
+    fi
+}
+
 is_local() {
-    local ip="$1"
-    # An empty ip must never classify as local: `hostname -I` output ends
-    # with a trailing space, so " ${LOCAL_IPS} " contains a double space
-    # that a zero-length pattern would match — routing a bogus command into
-    # the LOCAL container (a spurious pkill of OTHER sessions' trainers).
+    local spec="$1" ip
+    ip="$(node_host "${spec}")"
     [[ -n "${ip}" ]] || return 1
-    # Quoting "${ip}" makes the dots literal instead of regex wildcards.
     [[ " ${LOCAL_IPS} " =~ [[:space:]]"${ip}"[[:space:]] ]]
 }
 
@@ -322,6 +349,17 @@ remote_bash_cmd() {
 # callers.
 RUN_NODE_TIMEOUT=30
 
+node_ssh_opts() {
+    local spec="$1" port
+    port="$(node_port "${spec}")"
+    NODE_SSH_OPTS=(
+        -p "${port}" -i "${SSH_IDENTITY}"
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+        -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3
+        -o BatchMode=yes -o LogLevel=ERROR
+    )
+}
+
 # Run a command inside the target environment (local docker / remote SSH).
 run_node() {
     local ip="$1"
@@ -330,7 +368,8 @@ run_node() {
     if is_local "${ip}"; then
         timeout -k 5 "${RUN_NODE_TIMEOUT}" docker exec "${CONTAINER}" bash -c "${cmd}"
     else
-        timeout -k 5 "${RUN_NODE_TIMEOUT}" ssh "${SSH_OPTS[@]}" "${ip}" "$(remote_bash_cmd "${cmd}")"
+        node_ssh_opts "${ip}"
+        timeout -k 5 "${RUN_NODE_TIMEOUT}" ssh "${NODE_SSH_OPTS[@]}" "$(node_host "${ip}")" "$(remote_bash_cmd "${cmd}")"
     fi
 }
 
