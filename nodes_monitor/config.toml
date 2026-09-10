@@ -5,21 +5,26 @@
 # real values for your cluster. Parsed via embedded python (tomllib); python3 >= 3.11.
 
 [ssh]
-# Path to the SSH private key used to reach the nodes (host-side path).
+# Path to the SSH private key used to reach the nodes, RELATIVE TO
+# [paths] workspace_root. The tools run on the host, so the ssh client reads
+# the key at <workspace_root>/<identity>; a command running on a node sees the
+# same file at /workspace/<identity>.
 # Permissions are enforced to 0600 automatically at startup if too open.
-identity = "/path/to/cluster_ssh_key"
+identity = "./cluster_ssh_key"
 port = 2222
 
 [paths]
-# In-container workspace root: the mount point of your host workspace, i.e.
-#   <workspace_root>/UTILS/nodes_monitor/utils/... must exist inside the
-#   container.
-workspace_root = "/workspace/PROJECT"
-# Launcher script path AS VISIBLE INSIDE the container (run under docker exec
-# on the local node; the remote branch derives the same in-container path from
-# workspace_root). Defaults to
-# <workspace_root>/UTILS/nodes_monitor/utils/run_train.sh.
-# launcher_host = "/workspace/PROJECT/UTILS/nodes_monitor/utils/run_train.sh"
+# HOST-side path of the workspace directory that is mounted at /workspace
+# inside the container and on the compute nodes reached over ssh — i.e.
+#   <workspace_root>/UTILS/nodes_monitor/utils/...  (this host)
+#   /workspace/UTILS/nodes_monitor/utils/...        (container / node)
+# must name the same files. The node-side mount point (/workspace) is fixed by
+# the docker deployment.
+workspace_root = "/path/to/host/workspace"
+# Launcher script path AS SEEN ON A NODE (absolute; used under docker exec on
+# the local node and over ssh on the remote ones). Defaults to
+# /workspace/UTILS/nodes_monitor/utils/run_train.sh.
+# launcher_host = "/workspace/UTILS/nodes_monitor/utils/run_train.sh"
 
 [env]
 # Name of the docker container on the local node (used via `docker exec`).
@@ -43,7 +48,8 @@ marker = "__UTILS_train_job__"
 # The launcher injects the marker via TRAIN_TAG. Example:
 # command = "source /opt/conda/etc/profile.d/conda.sh && conda activate ENV &&"
 # Optional env-activation PREFIX for the CUDA health probe (the IDLE-vs-BROKEN
-# gate). The probe script path is derived from workspace_root, never hardcoded.
+# gate). The probe script path is derived from the node-side workspace mount
+# point (/workspace), never hardcoded.
 # Set this when torch is only importable inside a conda env, e.g.
 # probe_command = "source /opt/conda/etc/profile.d/conda.sh && conda activate ENV &&"
 

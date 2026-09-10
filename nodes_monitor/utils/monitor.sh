@@ -105,9 +105,12 @@ resolve_config() {
 # python manager even where this bash side no longer consumes the value
 # (LAUNCHER_HOST/TRAINER_COMMAND/THEME are read so unknown-key warnings stay
 # accurate and both sides parse the same config).
-SSH_IDENTITY=""
+SSH_IDENTITY=""        # [ssh] identity: key path RELATIVE to workspace_root (raw config value)
+SSH_IDENTITY_PATH=""   # resolved key path as THIS machine sees it (set by finalize_config)
 SSH_PORT=2222
-WORKSPACE_ROOT=""
+WORKSPACE_ROOT=""      # [paths] workspace_root: HOST view of the workspace dir
+HOST_IDENTITY=""       # <workspace_root>/<identity> — where the ssh client reads the key
+NODE_IDENTITY=""       # <NODE_ROOT>/<identity> — the same key as a node sees it
 LAUNCHER_HOST=""
 CONTAINER=""
 TRAINER_MARKER="__UTILS_train_job__"
@@ -124,14 +127,20 @@ NODE_HOSTS=()          # bare IP for transport/locality checks
 NODE_PORTS=()          # per-node port; 0 means use SSH_PORT
 IP_RE='^(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3}$'
 NODE_RE='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])){3})(:([1-9][0-9]{0,4}))?$'
-SSH_OPTS=()
 
-# Node-side CUDA probe (in-container path, derived from workspace_root by
-# finalize_config). It runs inside the container environment on the local node
-# (docker exec) and via plain ssh on remote nodes — which requires the
-# workspace to be mounted at workspace_root on the remote hosts as well. The
-# probe's interpreter is configurable via [trainer] probe_command (R3: the
-# system python3 may not see torch on nodes where it lives in a conda env).
+# Where the workspace is mounted for commands running ON A NODE: the container
+# of the local node (docker exec) and the remote nodes (plain ssh) both see the
+# directory as /workspace, while THIS host — where the tools run, and hence
+# where the ssh client reads the key — sees it as [paths] workspace_root. The
+# node-side mount point is the docker deployment's convention, not a config
+# value; only the host view is configurable.
+NODE_ROOT="/workspace"
+
+# Node-side CUDA probe path (derived from NODE_ROOT by finalize_config). It
+# runs inside the container environment on the local node (docker exec) and via
+# plain ssh on the remote nodes. The probe's interpreter is configurable via
+# [trainer] probe_command (the system python3 may not see torch on nodes where
+# it lives in a conda env).
 CUDA_PROBE=""
 
 # Tuning knobs; all overridable via the [monitor] section of the config.
@@ -212,40 +221,56 @@ finalize_config() {
         PGREP_PATTERN="[${TRAINER_MARKER:0:1}]${TRAINER_MARKER:1}"
     fi
 
-    # CUDA probe as seen INSIDE the container (docker exec on the local node;
-    # the remote branch runs the same in-container path over ssh). Derived
-    # from workspace_root so it lives in the same mount point on every node.
-    CUDA_PROBE="${WORKSPACE_ROOT}/UTILS/nodes_monitor/utils/cuda_probe.py"
+    # ---- workspace path model ----
+    # The same workspace directory has two names:
+    #   host view — [paths] workspace_root: where this script (and hence the
+    #               ssh client reading the key) runs;
+    #   node view — ${NODE_ROOT}: every command sent to a node runs in this
+    #               view (docker exec on the local node, plain ssh on the
+    #               remote ones).
+    # [ssh] identity is stored RELATIVE to the workspace, so the key file is
+    # <workspace_root>/<identity> here and ${NODE_ROOT}/<identity> on a node.
+    while [[ "${WORKSPACE_ROOT}" == */ && "${WORKSPACE_ROOT}" != "/" ]]; do
+        WORKSPACE_ROOT="${WORKSPACE_ROOT%/}"
+    done
+    if [[ "${SSH_IDENTITY}" == /* ]]; then
+        echo "Error: [ssh] identity must be relative to workspace_root (got '${SSH_IDENTITY}'; use e.g. identity = \"./cluster_ssh_key\")" >&2
+        exit 1
+    fi
+    local rel_identity="${SSH_IDENTITY}"
+    while [[ "${rel_identity}" == ./* ]]; do rel_identity="${rel_identity#./}"; done
+    if [[ -z "${rel_identity}" ]]; then
+        echo "Error: [ssh] identity must name a key file (got '${SSH_IDENTITY}')" >&2
+        exit 1
+    fi
+    HOST_IDENTITY="${WORKSPACE_ROOT}/${rel_identity}"
+    NODE_IDENTITY="${NODE_ROOT}/${rel_identity}"
+    # Resolve the key against THIS machine's view: normally the host view
+    # exists; when the tools themselves run inside the container, only the
+    # node view does. SSH_IDENTITY (the raw config value) stays untouched so a
+    # repeated finalize_config call re-resolves from the config, not from its
+    # own output.
+    if [[ -f "${HOST_IDENTITY}" ]]; then
+        SSH_IDENTITY_PATH="${HOST_IDENTITY}"
+    elif [[ -f "${NODE_IDENTITY}" ]]; then
+        SSH_IDENTITY_PATH="${NODE_IDENTITY}"
+    else
+        echo "Error: [ssh] identity file not found: tried ${HOST_IDENTITY} and ${NODE_IDENTITY}" >&2
+        exit 1
+    fi
 
-    # NOTE: StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null disable
-    # host-key verification — an accepted MITM exposure for internal cluster
-    # tooling behind a jump host.
-    #
-    # ServerAliveInterval/ServerAliveCountMax detect a node dying mid-command
-    # (~15s) so a strictly sequential query loop cannot stall on TCP
-    # retransmission timeouts.
-    SSH_OPTS=(
-        -p "${SSH_PORT}"
-        -i "${SSH_IDENTITY}"
-        -o StrictHostKeyChecking=no
-        -o UserKnownHostsFile=/dev/null
-        -o ConnectTimeout=5
-        -o ServerAliveInterval=5
-        -o ServerAliveCountMax=3
-        -o BatchMode=yes
-        -o LogLevel=ERROR
-    )
+    # CUDA probe path as seen from a node (docker exec on the local node; the
+    # remote branch runs the same node-side path over ssh).
+    CUDA_PROBE="${NODE_ROOT}/UTILS/nodes_monitor/utils/cuda_probe.py"
 
     # Auto-fix SSH private key permissions: OpenSSH ignores keys that are
     # group/world-readable. Tighten to 600 if too open so auth does not fail.
     # (GNU-specific stat -c; the 8# base forces octal interpretation.)
-    if [[ -f "${SSH_IDENTITY}" ]]; then
-        local perm
-        perm="$(stat -c '%a' "${SSH_IDENTITY}" 2>/dev/null || echo "")"
-        if [[ -n "${perm}" && $(( 8#${perm} & 077 )) -ne 0 ]]; then
-            if ! chmod 600 "${SSH_IDENTITY}" 2>/dev/null; then
-                echo "Warning: could not chmod 600 ${SSH_IDENTITY} (read-only fs / root-squash?); OpenSSH may refuse the key" >&2
-            fi
+    local perm
+    perm="$(stat -c '%a' "${SSH_IDENTITY_PATH}" 2>/dev/null || echo "")"
+    if [[ -n "${perm}" && $(( 8#${perm} & 077 )) -ne 0 ]]; then
+        if ! chmod 600 "${SSH_IDENTITY_PATH}" 2>/dev/null; then
+            echo "Warning: could not chmod 600 ${SSH_IDENTITY_PATH} (read-only fs / root-squash?); OpenSSH may refuse the key" >&2
         fi
     fi
 }
@@ -264,7 +289,8 @@ load_nodes() {
                 exit 1
             fi
             host="${BASH_REMATCH[1]}"
-            port="${BASH_REMATCH[5]:-0}"
+            # Group 6 = port digits (empty for a bare IP -> 0 = use SSH_PORT).
+            port="${BASH_REMATCH[6]:-0}"
             (( port == 0 || port <= 65535 )) || { echo "Error: invalid port in node '${spec}'" >&2; exit 1; }
             IPS+=("${spec}")
             NODE_HOSTS+=("${host}")
@@ -288,7 +314,8 @@ load_nodes() {
                 exit 1
             fi
             host="${BASH_REMATCH[1]}"
-            port="${BASH_REMATCH[5]:-0}"
+            # Group 6 = port digits (empty for a bare IP -> 0 = use SSH_PORT).
+            port="${BASH_REMATCH[6]:-0}"
             (( port == 0 || port <= 65535 )) || { echo "Error: invalid port in node '${spec}'" >&2; exit 1; }
             IPS+=("${spec}")
             NODE_HOSTS+=("${host}")
@@ -318,8 +345,15 @@ node_host() {
 node_port() {
     local spec="$1"
     if [[ "${spec}" =~ ${NODE_RE} ]]; then
-        local port="${BASH_REMATCH[5]:-0}"
-        (( port <= 65535 )) || { printf '%s' "${SSH_PORT}"; return; }
+        # Group 6 is the port DIGITS (group 5 wraps them together with the
+        # ':'), and it is EMPTY for the common bare-IP entry. It must fall
+        # back to [ssh].port — never to 0: `ssh -p 0` dies with "Bad port
+        # '0'", so every node without a per-node port failed transport
+        # (view.sh saw the whole cluster as OFFLINE while manager.py, whose
+        # parse_node() defaults correctly, saw them as IDLE).
+        local port="${BASH_REMATCH[6]:-}"
+        [[ -n "${port}" ]] || port="${SSH_PORT}"
+        (( port <= 65535 )) || port="${SSH_PORT}"
         printf '%s' "${port}"
     else
         printf '%s' "${SSH_PORT}"
@@ -349,11 +383,18 @@ remote_bash_cmd() {
 # callers.
 RUN_NODE_TIMEOUT=30
 
+# Build the ssh options for one node. -i points at the key resolved by
+# finalize_config (SSH_IDENTITY_PATH). NOTE: StrictHostKeyChecking=no +
+# UserKnownHostsFile=/dev/null disable host-key verification — an accepted
+# MITM exposure for internal cluster tooling behind a jump host.
+# ServerAliveInterval/ServerAliveCountMax detect a node dying mid-command
+# (~15s) so a strictly sequential query loop cannot stall on TCP
+# retransmission timeouts.
 node_ssh_opts() {
     local spec="$1" port
     port="$(node_port "${spec}")"
     NODE_SSH_OPTS=(
-        -p "${port}" -i "${SSH_IDENTITY}"
+        -p "${port}" -i "${SSH_IDENTITY_PATH}"
         -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
         -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3
         -o BatchMode=yes -o LogLevel=ERROR
@@ -405,9 +446,10 @@ PROBE_FAIL_THRESHOLD=3
 probe_cuda() {
     local ip="$1"
     # PROBE_COMMAND is an optional env-activation PREFIX (e.g. "source ...
-    # && conda activate ENV &&"); the probe script path is derived from
-    # workspace_root, never hardcoded in config. torch must be importable by
-    # whatever interpreter the prefix selects (system python3 often lacks it).
+    # && conda activate ENV &&"); the probe script path is derived from the
+    # node-side workspace mount point (NODE_ROOT), never hardcoded in config.
+    # torch must be importable by whatever interpreter the prefix selects
+    # (system python3 often lacks it).
     local prefix="${PROBE_COMMAND:+${PROBE_COMMAND} }"
     run_node "${ip}" "${prefix}python3 ${CUDA_PROBE}" >/dev/null 2>&1
 }

@@ -97,6 +97,22 @@ QUIT = False
 
 MARKER = "__UTILS_train_job__"
 PGREP_PATTERN = None  # derived from the marker in finalize_config()
+SSH_IDENTITY_PATH = ""  # ssh key path as THIS machine sees it (finalize_config)
+
+# Where the workspace is mounted for commands running ON A NODE: the container
+# of the local node (docker exec) and the remote nodes (plain ssh) both see the
+# directory as /workspace, while THIS host — where the tools run, and hence
+# where the ssh client reads the key — sees it as [paths] workspace_root. The
+# node-side mount point is the docker deployment's convention, not a config
+# value; only the host view is configurable. Mirrors NODE_ROOT in monitor.sh.
+NODE_ROOT = "/workspace"
+
+
+def node_path(*parts):
+    """Absolute path as seen by a command executed on a node (docker exec on
+    the local node, ssh on the remote ones)."""
+    return os.path.join(NODE_ROOT, *parts)
+
 
 # Re-launch throttle for try_sweep: after an attempt on an ip, wait this long
 # before arming another launch (a dying trainer must not be re-fired every
@@ -265,7 +281,7 @@ def load_config(cfg_file=None):
 # permissions (OpenSSH refuses keys readable by others). Mirrors
 # finalize_config in monitor.sh.
 def finalize_config():
-    global PGREP_PATTERN
+    global PGREP_PATTERN, SSH_IDENTITY_PATH
     ws = CONF.get("paths", {}).get("workspace_root", "")
     identity = CONF.get("ssh", {}).get("identity", "")
     container = CONF.get("env", {}).get("container", "")
@@ -276,16 +292,40 @@ def finalize_config():
     if not container:
         sys.exit("Error: [env] container is required")
 
-    if not os.path.isfile(identity):
-        sys.exit(f"Error: [ssh] identity file not found: {identity}")
+    # ---- workspace path model ----
+    # The same workspace directory has two names:
+    #   host view — [paths] workspace_root: where this program (and hence the
+    #               ssh client reading the key) runs;
+    #   node view — NODE_ROOT: every command sent to a node runs in this view
+    #               (docker exec on the local node, plain ssh on the remote
+    #               ones).
+    # [ssh] identity is stored RELATIVE to the workspace, so the key file is
+    # <workspace_root>/<identity> here and <NODE_ROOT>/<identity> on a node.
+    ws = ws.rstrip("/") or "/"
+    if os.path.isabs(identity):
+        sys.exit(f"Error: [ssh] identity must be relative to workspace_root "
+                 f"(got '{identity}'; use e.g. identity = \"./cluster_ssh_key\")")
+    host_identity = os.path.normpath(os.path.join(ws, identity))
+    node_identity = os.path.normpath(os.path.join(NODE_ROOT, identity))
+    # Resolve the key against THIS machine's view: normally the host view
+    # exists; when the tools themselves run inside the container, only the node
+    # view does.
+    if os.path.isfile(host_identity):
+        SSH_IDENTITY_PATH = host_identity
+    elif os.path.isfile(node_identity):
+        SSH_IDENTITY_PATH = node_identity
+    else:
+        sys.exit(f"Error: [ssh] identity file not found: tried {host_identity} "
+                 f"and {node_identity}")
+
     # Auto-fix SSH private key permissions: OpenSSH ignores keys that are
     # group/world-readable. Tighten to 600 if too open so auth does not fail.
-    if os.stat(identity).st_mode & 0o077:
+    if os.stat(SSH_IDENTITY_PATH).st_mode & 0o077:
         try:
-            os.chmod(identity, 0o600)
+            os.chmod(SSH_IDENTITY_PATH, 0o600)
         except OSError:
             # Warn but do not die: the fs may be read-only / root-squashed.
-            print(f"Warning: could not chmod 600 {identity} (read-only fs / "
+            print(f"Warning: could not chmod 600 {SSH_IDENTITY_PATH} (read-only fs / "
                   f"root-squash?); OpenSSH may refuse the key", file=sys.stderr)
 
     # Keep the pgrep/pkill pattern in sync with the marker: derive it from
@@ -390,8 +430,8 @@ def ssh_opts(ip=None):
         "-o", "BatchMode=yes",
         "-o", "LogLevel=ERROR",
     ]
-    if ssh.get("identity"):
-        opts += ["-i", ssh["identity"]]
+    if SSH_IDENTITY_PATH:
+        opts += ["-i", SSH_IDENTITY_PATH]
     return opts
 
 
@@ -438,9 +478,8 @@ def check_trainer(ip):
 
 def probe_cuda(ip):
     prefix = CONF.get("trainer", {}).get("probe_command", "")
-    ws = CONF.get("paths", {}).get("workspace_root", "")
-    probe = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "cuda_probe.py")
-    # shlex.quote: workspace_root (hence the probe path) may contain spaces.
+    probe = node_path("UTILS", "nodes_monitor", "utils", "cuda_probe.py")
+    # shlex.quote: the node-side path may contain spaces.
     return run_node(ip, f"{prefix}python3 {shlex.quote(probe)}")[0]
 
 
@@ -566,23 +605,24 @@ def launch_trainer(ip):
     trainer = CONF.get("trainer", {})
     prefix = trainer.get("command", "")
     marker = trainer.get("marker", MARKER)
-    ws = CONF.get("paths", {}).get("workspace_root", "")
-    launcher = CONF.get("paths", {}).get("launcher_host") or os.path.join(
-        ws, "UTILS", "nodes_monitor", "utils", "run_train.sh")
+    # [paths] launcher_host, when set, is an absolute NODE-side path (as seen
+    # inside the container / on the compute nodes); the default is derived from
+    # the node-side workspace mount point.
+    launcher = CONF.get("paths", {}).get("launcher_host") or node_path(
+        "UTILS", "nodes_monitor", "utils", "run_train.sh")
     if is_local(ip):
-        # shlex.quote the paths: workspace_root (hence the launcher path) and
-        # LOG_FILE may contain spaces, which would otherwise split into
-        # separate words on the node-side shell.
+        # shlex.quote the paths: the launcher path and LOG_FILE may contain
+        # spaces, which would otherwise split into separate words on the
+        # node-side shell.
         cmd = "{ %sTRAIN_TAG='%s' bash %s; } > %s 2>&1" % (
             prefix, marker, shlex.quote(launcher), shlex.quote(LOG_FILE))
         p = subprocess.Popen(["docker", "exec", "-d",
                               CONF.get("env", {}).get("container", ""),
                               "bash", "-c", cmd])
     else:
-        remote_script = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "run_train.sh")
         # Same quoting as above; the quotes shlex.quote adds are single
         # quotes, which the `escaped` rewrite below already survives.
-        inner = "%sTRAIN_TAG='%s' bash %s" % (prefix, marker, shlex.quote(remote_script))
+        inner = "%sTRAIN_TAG='%s' bash %s" % (prefix, marker, shlex.quote(launcher))
         escaped = inner.replace("'", "'\\''")
         cmd = "setsid bash -c '%s' > %s 2>&1 < /dev/null &" % (escaped, shlex.quote(LOG_FILE))
         p = subprocess.Popen(["ssh", "-f", *ssh_opts(ip), node_host(ip),
@@ -1485,8 +1525,7 @@ def cmd_kill(spec):
         return
     set_message(f"{YELLOW}kill: working…{R}")
     render()
-    ws = CONF.get("paths", {}).get("workspace_root", "")
-    script = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
+    script = node_path("UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
 
     def work():
         try:

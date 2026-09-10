@@ -34,7 +34,6 @@ even `import manager` is deferred until after argument validation, so
 
 import argparse
 import concurrent.futures
-import os
 import sys
 import time
 
@@ -182,8 +181,7 @@ def do_kill(targets):
     stdout line (its one-line summary, e.g. "SIGTERM'd: 2, SIGKILL'd: 0");
     any non-zero rc means the node could not be reached or the script
     failed — reported as 'unreachable', like the GUI."""
-    ws = manager.CONF["paths"]["workspace_root"]
-    script = os.path.join(ws, "UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
+    script = manager.node_path("UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
 
     def kill_one(ip):
         try:
