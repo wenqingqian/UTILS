@@ -51,12 +51,10 @@ marker = "__UTILS_train_job__"
 # Optional tuning; the values below are the defaults.
 # interval = 5
 # cooldown = 43200
-#   Trust window for cached CUDA-probe verdicts. The probe occupies GPU
-#   memory while it runs (a CUDA context per GPU, visible in nvidia-smi), so
-#   it must not fire casually: the manager probes once at startup and never
-#   re-probes confirmed verdicts, and view.sh reuses a verdict written within
-#   `cooldown` verbatim. Inconclusive probes (transport/environment failures
-#   — they touch no GPU) are retried every 60 s regardless of this value.
+#   Trust window for cached confirmed-BROKEN CUDA probe verdicts. The probe
+#   runs once per GPU-bearing node on each view.sh call, including occupied
+#   nodes; a confirmed BROKEN result takes precedence over USED. Healthy and
+#   inconclusive results are not trusted across calls and are probed again.
 #   To force a fresh verdict for one node, delete its cache file:
 #   ${TMPDIR:-/tmp}/utils_monitor_probe-<uid>/<ip>
 # compute_threshold = 0

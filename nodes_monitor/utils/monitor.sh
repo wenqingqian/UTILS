@@ -388,17 +388,17 @@ fetch_gpu_data() {
     return "${rc}"
 }
 
-# Per-IP CUDA-probe verdicts, cached in FILES so a view.sh call reuses the
-# verdict of an earlier call instead of re-importing torch over ssh. The
-# probe occupies GPU memory while it runs, so each view.sh run measures at
-# most once per node — at its own startup, and only when no verdict written
-# within the last COOLDOWN is on file. Files (not shell variables) are used
-# because view.sh fetches node state in background subshells, where variable
-# mutations are lost; the mtime check makes stale files self-expiring.
+# Per-IP CUDA-probe verdicts, cached in FILES so a view.sh call can reuse a
+# confirmed BROKEN result without re-importing torch over ssh. The probe
+# occupies GPU memory while it runs, so each view.sh run probes at most once per
+# GPU-bearing node. Files (not shell variables) are used because view.sh fetches
+# node state in background subshells, where variable mutations are lost.
 #
-# Verdicts: 0 = healthy, 1 = GPU probe failed PROBE_FAIL_THRESHOLD times in a
-# row (confirmed BROKEN), 2 = transient/environment failure — NOT treated as
-# BROKEN, so a single flaky probe never mislabels a healthy node.
+# Only verdict 1 (confirmed BROKEN) is reusable across calls. Healthy (0) and
+# inconclusive (2) results are deliberately not cached as trusted outcomes, so
+# every subsequent view can re-check a node that may have recovered or become
+# wedged after the previous observation.
+
 PROBE_CACHE_DIR="${TMPDIR:-/tmp}/utils_monitor_probe-$(id -u)"
 PROBE_FAIL_THRESHOLD=3
 
@@ -419,35 +419,20 @@ probe_cuda_cached() {
     now=$(date +%s)
     cache="${PROBE_CACHE_DIR}/${ip}"
     if [[ -f "${cache}" ]]; then
-        local verdict window
+        local verdict
         verdict="$(<"${cache}")"
-        case "${verdict}" in
-            0|1|2)
-                # Confirmed verdicts (0 healthy / 1 BROKEN) stay trusted for
-                # the full COOLDOWN (12h by default); inconclusive (2)
-                # expires after PROBE_RETRY so an UNVERIFIED node re-probes
-                # soon (that retry touches no GPU — failures happen before
-                # the probe reaches CUDA).
-                if (( verdict == 2 )); then
-                    window="${PROBE_RETRY}"
-                else
-                    window="${COOLDOWN}"
-                fi
-                if (( now - $(stat -c '%Y' "${cache}" 2>/dev/null || echo 0) < window )); then
-                    return "${verdict}"
-                fi
-                ;;
-            *)
-                # Empty/corrupt cache file — Ctrl-C can kill a probe subshell
-                # between truncate and write, leaving a zero-length file with
-                # a FRESH mtime. Treat it as a cache MISS and re-probe: never
-                # mislabel a healthy node BROKEN for a full COOLDOWN on
-                # the strength of a truncated file.
-                ;;
-        esac
+        # Only a confirmed BROKEN verdict is trusted across view.sh calls.
+        # Healthy and inconclusive verdicts are observations for that call, not
+        # durable evidence that the node remains healthy.
+        if [[ "${verdict}" == "1" ]]; then
+            if (( now - $(stat -c '%Y' "${cache}" 2>/dev/null || echo 0) < COOLDOWN )); then
+                return 1
+            fi
+        fi
     fi
 
     local verdict=1 fail_file fails
+
     fail_file="${PROBE_CACHE_DIR}/${ip}.fails"
     if probe_cuda "${ip}"; then
         verdict=0
@@ -557,26 +542,24 @@ get_node_state() {
         _trainer_ref=1
     fi
 
-    if (( _trainer_ref == 1 )); then
+    # Probe every GPU-bearing node, including nodes that currently hold memory
+    # or run compute. A CUDA context failure is a health property and must not
+    # be hidden behind the occupancy-derived USED state. Only a confirmed
+    # BROKEN verdict overrides occupancy; an inconclusive probe preserves
+    # TRAIN/USED when work is visible, but keeps an otherwise-free node out of
+    # the IDLE pool as UNVERIFIED.
+    local prc=0
+    probe_cuda_cached "${ip}" || prc=$?
+    if (( prc == 1 )); then
+        _state_ref="BROKEN"
+    elif (( _trainer_ref == 1 )); then
         _state_ref="TRAIN"
     elif (( _compute_ref > 0 || _mem_used_ref > 0 )); then
         _state_ref="USED"
+    elif (( prc == 2 )); then
+        _state_ref="UNVERIFIED"
     else
         _state_ref="IDLE"
-        # Verdict 1 = PROBE_FAIL_THRESHOLD consecutive GPU-probe failures
-        # (confirmed BROKEN). Verdict 2 (transient/environment) now yields
-        # UNVERIFIED instead of IDLE — same semantics as manager.py's
-        # get_node_state, whose --train auto-launch only fires on state ==
-        # IDLE: an unverified (inconclusively probed) node must never report
-        # IDLE, or it would keep being auto-occupied.
-        # The `|| prc=$?` keeps set -e from aborting on the non-zero verdicts.
-        local prc=0
-        probe_cuda_cached "${ip}" || prc=$?
-        if (( prc == 1 )); then
-            _state_ref="BROKEN"
-        elif (( prc == 2 )); then
-            _state_ref="UNVERIFIED"
-        fi
     fi
 }
 

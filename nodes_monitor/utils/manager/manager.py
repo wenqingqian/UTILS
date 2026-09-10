@@ -206,9 +206,9 @@ _KNOWN_KEYS = {
     "trainer": {"marker", "pgrep_pattern", "command", "probe_command"},
     "monitor": {"interval", "cooldown", "compute_threshold",
                 "mem_used_threshold", "log_file"},
-    # "cooldown" is accepted for schema parity with monitor.sh (it is the
-    # view.sh probe-cache trust window there); the manager never re-probes
-    # confirmed verdicts, so it never consumes the value (probe_cuda_cached).
+    # "cooldown" is accepted for schema parity with monitor.sh and controls
+    # the view.sh BROKEN-cache trust window. The manager retains only its
+    # confirmed BROKEN verdict in process memory and re-probes other outcomes.
     "ui": {"theme"},
     "nodes": {"list", "file"},
 }
@@ -447,7 +447,6 @@ def probe_cuda(ip):
 PROBE_TS = {}      # ip -> (epoch, verdict 0/1/2)
 PROBE_FAILS = {}   # ip -> consecutive rc=1 failures
 PROBE_FAIL_THRESHOLD = 3
-PROBE_RETRY = 60   # inconclusive-verdict (2) retry cadence — touches no GPU
 PROBE_LOCKS = defaultdict(threading.Lock)   # one probe in flight per ip
 
 
@@ -456,31 +455,24 @@ def probe_cuda_cached(ip):
     rc=1 failures), 2 = inconclusive (transport/environment failure — NOT a
     GPU verdict; callers must not treat it as BROKEN).
 
-    The probe occupies GPU memory while it runs (a CUDA context per GPU
-    shows up in nvidia-smi), so it fires ONCE per session: the startup round
-    fills the cache and a confirmed verdict (0/1) is then frozen for the
-    process lifetime. Consequence: a mid-session DRIVER-level failure on an
-    IDLE node is still caught by the nvidia-smi path (fetch failure ->
-    BROKEN), but context-level wedging (nvidia-smi fine, torch init fails)
-    is not re-detected — try_sweep's TRY_FAIL_LIMIT bounds the crash-loop
-    that would otherwise follow on such a node. Only inconclusive verdicts
-    (2) re-probe, after PROBE_RETRY: their failures happen at the
-    transport/environment layer and touch no GPU.
-    The per-ip lock keeps concurrent callers (startup round + node workers)
-    from probing the same node twice."""
+    The probe occupies GPU memory while it runs and is performed once per
+    state observation, including on occupied nodes, so a wedged CUDA context
+    cannot be hidden by USED. Only a confirmed BROKEN verdict is retained for
+    the process lifetime; healthy and inconclusive results are refreshed on
+    the next observation. The per-ip lock keeps concurrent callers from
+    probing the same node twice."""
     if ip in PROBE_TS:
         ts, verdict = PROBE_TS[ip]
-        if verdict != 2:
-            return verdict
-        if time.time() - ts < PROBE_RETRY:
+        # Only confirmed BROKEN is reusable. Healthy and inconclusive results
+        # are per-observation values and must be re-probed on the next state
+        # collection so recovery and newly wedged contexts are detectable.
+        if verdict == 1:
             return verdict
     with PROBE_LOCKS[ip]:
         # Another thread may have probed while we waited for the lock.
         if ip in PROBE_TS:
             ts, verdict = PROBE_TS[ip]
-            if verdict != 2:
-                return verdict
-            if time.time() - ts < PROBE_RETRY:
+            if verdict == 1:
                 return verdict
         rc = probe_cuda(ip)
         if rc == 0:
@@ -521,15 +513,22 @@ def get_node_state(ip):
     if total == 0:
         return (0, 0, "NO_GPU")
     if check_trainer(ip):
-        return (total, compute, "TRAIN")
-    if compute > 0 or mem > 0:
-        return (total, compute, "USED")
+        trainer = True
+    else:
+        trainer = False
+
+    # Probe health before classifying occupancy so a wedged CUDA context cannot
+    # be hidden behind USED. A confirmed BROKEN verdict overrides occupancy;
+    # inconclusive results preserve TRAIN/USED, while an otherwise-free node is
+    # kept out of the IDLE pool as UNVERIFIED.
     verdict = probe_cuda_cached(ip)
     if verdict == 1:
         return (total, compute, "BROKEN")
+    if trainer:
+        return (total, compute, "TRAIN")
+    if compute > 0 or mem > 0:
+        return (total, compute, "USED")
     if verdict == 2:
-        # Inconclusive (transport/environment): never IDLE — an unverified
-        # node must not be auto-occupied by try_sweep.
         return (total, compute, "UNVERIFIED")
     return (total, compute, "IDLE")
 
