@@ -136,7 +136,9 @@ NODE_RE='^((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[
 # value; only the host view is configurable.
 NODE_ROOT="/workspace"
 
-# Node-side CUDA probe path (derived from NODE_ROOT by finalize_config). It
+# Node-side CUDA probe path (derived by finalize_config from NODE_ROOT + this
+# repo's path relative to the workspace — the repo may sit in a workspace
+# subdirectory, so no fixed "UTILS" segment). It
 # runs inside the container environment on the local node (docker exec) and via
 # plain ssh on the remote nodes. The probe's interpreter is configurable via
 # [trainer] probe_command (the system python3 may not see torch on nodes where
@@ -260,8 +262,26 @@ finalize_config() {
     fi
 
     # CUDA probe path as seen from a node (docker exec on the local node; the
-    # remote branch runs the same node-side path over ssh).
-    CUDA_PROBE="${NODE_ROOT}/UTILS/nodes_monitor/utils/cuda_probe.py"
+    # remote branch runs the same node-side path over ssh). The repo's location
+    # within the workspace is DERIVED from this script's real path — never a
+    # hardcoded "UTILS" segment: the repo may sit in a subdirectory of the
+    # workspace (e.g. <ws>/sga_framework/UTILS), where a fixed segment resolves
+    # to a path that does not exist on any node. Host view first, node view as
+    # fallback (the tools themselves may run inside the container); pwd -P and
+    # realpath collapse symlinks so the relative path compares physical dirs.
+    local utils_root utils_rel="" root
+    utils_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
+    for root in "${WORKSPACE_ROOT}" "${NODE_ROOT}"; do
+        utils_rel="$(realpath -m --relative-to="${root}" "${utils_root}")"
+        if [[ "${utils_rel}" != ".." && "${utils_rel}" != ../* ]]; then
+            break
+        fi
+    done
+    if [[ "${utils_rel}" == ".." || "${utils_rel}" == ../* ]]; then
+        echo "Error: the UTILS repo (${utils_root}) is outside both [paths] workspace_root (${WORKSPACE_ROOT}) and the node workspace (${NODE_ROOT}) — move it under the workspace" >&2
+        exit 1
+    fi
+    CUDA_PROBE="${NODE_ROOT}/${utils_rel}/nodes_monitor/utils/cuda_probe.py"
 
     # Auto-fix SSH private key permissions: OpenSSH ignores keys that are
     # group/world-readable. Tighten to 600 if too open so auth does not fail.

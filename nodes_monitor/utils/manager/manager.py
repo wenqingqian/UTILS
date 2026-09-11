@@ -99,6 +99,14 @@ MARKER = "__UTILS_train_job__"
 PGREP_PATTERN = None  # derived from the marker in finalize_config()
 SSH_IDENTITY_PATH = ""  # ssh key path as THIS machine sees it (finalize_config)
 
+# This repo's path RELATIVE TO the workspace, derived in finalize_config from
+# UTILS_ROOT's real location — never assumed to be a bare "UTILS" (the repo
+# may sit in a subdirectory of the workspace, e.g. <ws>/sga_framework/UTILS).
+# The node-side path of anything in the repo is then NODE_ROOT/UTILS_WS_REL/...
+# The "UTILS" default preserves the flat-layout answer for any node_path call
+# made before finalize_config runs.
+UTILS_WS_REL = "UTILS"
+
 # Where the workspace is mounted for commands running ON A NODE: the container
 # of the local node (docker exec) and the remote nodes (plain ssh) both see the
 # directory as /workspace, while THIS host — where the tools run, and hence
@@ -281,7 +289,7 @@ def load_config(cfg_file=None):
 # permissions (OpenSSH refuses keys readable by others). Mirrors
 # finalize_config in monitor.sh.
 def finalize_config():
-    global PGREP_PATTERN, SSH_IDENTITY_PATH
+    global PGREP_PATTERN, SSH_IDENTITY_PATH, UTILS_WS_REL
     ws = CONF.get("paths", {}).get("workspace_root", "")
     identity = CONF.get("ssh", {}).get("identity", "")
     container = CONF.get("env", {}).get("container", "")
@@ -317,6 +325,26 @@ def finalize_config():
     else:
         sys.exit(f"Error: [ssh] identity file not found: tried {host_identity} "
                  f"and {node_identity}")
+
+    # Node-side location of THIS repo: NODE_ROOT + the repo's path relative to
+    # the workspace. Derived, never hardcoded — the repo may sit in a
+    # subdirectory of the workspace (e.g. <ws>/sga_framework/UTILS), and a
+    # fixed "UTILS" segment then resolves to a path that does not exist on any
+    # node (probe/launcher fail with rc=2 and free nodes show UNVERIFIED).
+    # Like the identity above, the derivation tries the host view first and
+    # falls back to the node view for tools running inside the container.
+    # realpath collapses symlinks on both sides so relpath compares the same
+    # physical directories.
+    utils_root = os.path.realpath(UTILS_ROOT)
+    for root in (ws, NODE_ROOT):
+        cand = os.path.relpath(utils_root, os.path.realpath(root))
+        if cand != ".." and not cand.startswith("../"):
+            UTILS_WS_REL = cand
+            break
+    else:
+        sys.exit(f"Error: the UTILS repo ({utils_root}) is outside both "
+                 f"[paths] workspace_root ({ws}) and the node workspace "
+                 f"({NODE_ROOT}) — move it under the workspace")
 
     # Auto-fix SSH private key permissions: OpenSSH ignores keys that are
     # group/world-readable. Tighten to 600 if too open so auth does not fail.
@@ -478,7 +506,7 @@ def check_trainer(ip):
 
 def probe_cuda(ip):
     prefix = CONF.get("trainer", {}).get("probe_command", "")
-    probe = node_path("UTILS", "nodes_monitor", "utils", "cuda_probe.py")
+    probe = node_path(UTILS_WS_REL, "nodes_monitor", "utils", "cuda_probe.py")
     # shlex.quote: the node-side path may contain spaces.
     return run_node(ip, f"{prefix}python3 {shlex.quote(probe)}")[0]
 
@@ -609,7 +637,7 @@ def launch_trainer(ip):
     # inside the container / on the compute nodes); the default is derived from
     # the node-side workspace mount point.
     launcher = CONF.get("paths", {}).get("launcher_host") or node_path(
-        "UTILS", "nodes_monitor", "utils", "run_train.sh")
+        UTILS_WS_REL, "nodes_monitor", "utils", "run_train.sh")
     if is_local(ip):
         # shlex.quote the paths: the launcher path and LOG_FILE may contain
         # spaces, which would otherwise split into separate words on the
@@ -1525,7 +1553,7 @@ def cmd_kill(spec):
         return
     set_message(f"{YELLOW}kill: working…{R}")
     render()
-    script = node_path("UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
+    script = node_path(UTILS_WS_REL, "nodes_monitor", "utils", "gpu_kill.sh")
 
     def work():
         try:

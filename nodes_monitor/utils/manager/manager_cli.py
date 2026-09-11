@@ -181,7 +181,7 @@ def do_kill(targets):
     stdout line (its one-line summary, e.g. "SIGTERM'd: 2, SIGKILL'd: 0");
     any non-zero rc means the node could not be reached or the script
     failed — reported as 'unreachable', like the GUI."""
-    script = manager.node_path("UTILS", "nodes_monitor", "utils", "gpu_kill.sh")
+    script = manager.node_path(manager.UTILS_WS_REL, "nodes_monitor", "utils", "gpu_kill.sh")
 
     def kill_one(ip):
         try:

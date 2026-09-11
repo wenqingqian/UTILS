@@ -15,15 +15,18 @@ port = 2222
 
 [paths]
 # HOST-side path of the workspace directory that is mounted at /workspace
-# inside the container and on the compute nodes reached over ssh — i.e.
-#   <workspace_root>/UTILS/nodes_monitor/utils/...  (this host)
-#   /workspace/UTILS/nodes_monitor/utils/...        (container / node)
-# must name the same files. The node-side mount point (/workspace) is fixed by
-# the docker deployment.
+# inside the container and on the compute nodes reached over ssh. The
+# node-side path of anything in this repo is DERIVED, not configured:
+#   /workspace/<this repo's path relative to workspace_root>/...
+# e.g. a repo at <workspace_root>/sga_framework/UTILS is addressed on nodes
+# as /workspace/sga_framework/UTILS/... — the repo may live in any
+# subdirectory of the workspace, but MUST live under it (or under /workspace
+# itself when the tools run inside the container). The node-side mount point
+# (/workspace) is fixed by the docker deployment.
 workspace_root = "/path/to/host/workspace"
 # Launcher script path AS SEEN ON A NODE (absolute; used under docker exec on
-# the local node and over ssh on the remote ones). Defaults to
-# /workspace/UTILS/nodes_monitor/utils/run_train.sh.
+# the local node and over ssh on the remote ones). Defaults to the derived
+# /workspace/<repo-rel>/nodes_monitor/utils/run_train.sh.
 # launcher_host = "/workspace/UTILS/nodes_monitor/utils/run_train.sh"
 
 [env]
