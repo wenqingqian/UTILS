@@ -122,15 +122,15 @@ def node_path(*parts):
     return os.path.join(NODE_ROOT, *parts)
 
 
-# Re-launch throttle for try_sweep: after an attempt on an ip, wait this long
-# before arming another launch (a dying trainer must not be re-fired every
-# INTERVAL). Deliberately NOT tied to the probe cache window (cooldown).
-LAUNCH_COOLDOWN = 60
+# Cadence model (both here and in monitor.sh): INTERVAL paces the cheap
+# nvidia-smi state poll only; every other cadence — the CUDA-probe trust
+# window, the try_sweep re-launch throttle and view.sh's BROKEN-cache window —
+# is COOLDOWN (see load_config).
 # Strike limit for try_sweep: this many consecutive launches on an ip without
-# the trainer ever coming up disarm it with a warning. Guards the frozen
-# healthy verdict against a node whose nvidia-smi works but whose CUDA
-# contexts are wedged — the trainer would crash at init and be re-fired
-# forever (the probe that would flag it BROKEN only runs at startup).
+# the trainer ever coming up disarm it with a warning. Guards against a node
+# whose nvidia-smi works but whose CUDA contexts are wedged — the trainer
+# would crash at init and be re-fired forever. launch_trainer also re-probes
+# such a node right before every launch, so a wedged one is refused outright.
 TRY_FAIL_LIMIT = 3
 
 # Trainers launched by THIS session; cleanup() kills them on exit so no
@@ -230,16 +230,15 @@ _KNOWN_KEYS = {
     "trainer": {"marker", "pgrep_pattern", "command", "probe_command"},
     "monitor": {"interval", "cooldown", "compute_threshold",
                 "mem_used_threshold", "log_file"},
-    # "cooldown" is accepted for schema parity with monitor.sh and controls
-    # the view.sh BROKEN-cache trust window. The manager retains only its
-    # confirmed BROKEN verdict in process memory and re-probes other outcomes.
+    # "interval" = the plain nvidia-smi state poll; "cooldown" = every other
+    # cadence, identically in the manager and in monitor.sh / view.sh.
     "ui": {"theme"},
     "nodes": {"list", "file"},
 }
 
 
 def load_config(cfg_file=None):
-    global CONF, INTERVAL, COMPUTE_THRESHOLD, MEM_THRESHOLD, LOG_FILE
+    global CONF, INTERVAL, COOLDOWN, COMPUTE_THRESHOLD, MEM_THRESHOLD, LOG_FILE
     candidates = []
     if cfg_file:
         candidates.append(cfg_file)
@@ -273,15 +272,13 @@ def load_config(cfg_file=None):
     mon = CONF.get("monitor", {})
     ui = CONF.get("ui", {})
     INTERVAL = int(mon.get("interval", 5))
+    # Every cadence that is not the plain nvidia-smi state poll, so one knob
+    # paces all of them (same meaning in monitor.sh / view.sh): how long a CUDA
+    # probe verdict is trusted, how soon try_sweep may re-fire a launch.
+    COOLDOWN = int(mon.get("cooldown", 600))
     COMPUTE_THRESHOLD = int(mon.get("compute_threshold", 0))
     MEM_THRESHOLD = int(mon.get("mem_used_threshold", 100))
     LOG_FILE = mon.get("log_file", "/tmp/utils_train.log")
-    if "cooldown" in mon:
-        # Accepted for schema parity but consumed only by monitor.sh's probe
-        # cache — say so instead of letting an operator assume it throttles
-        # try_sweep (it did in old versions).
-        print("Note: monitor.cooldown is a view.sh probe-cache knob; the "
-              "manager ignores it", file=sys.stderr)
 
 
 # Called after load_config (by main() and by manager_cli.py): derive
@@ -464,12 +461,18 @@ def ssh_opts(ip=None):
 
 
 def run_node(ip, cmd, timeout=30):
-    """Run cmd in the target environment; return (rc, stdout_text)."""
+    """Run cmd in the target environment; return (rc, stdout_text).
+
+    stdin is /dev/null for every child: the ssh client inherits the caller's
+    stdin by default, and when that is the workbench's terminal it goes into
+    raw mode and swallows the user's keystrokes (the input box then drops
+    characters and stalls in the blocking read)."""
     if is_local(ip):
         try:
             p = subprocess.run(["docker", "exec", CONF.get("env", {}).get("container", ""),
                                 "bash", "-c", cmd],
-                               capture_output=True, timeout=timeout)
+                               capture_output=True, timeout=timeout,
+                               stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             return (124, "")
         except (FileNotFoundError, OSError):
@@ -477,7 +480,8 @@ def run_node(ip, cmd, timeout=30):
         return (p.returncode, p.stdout.decode("utf-8", "replace"))
     try:
         p = subprocess.run(["ssh", *ssh_opts(ip), node_host(ip), "bash -c " + shlex.quote(cmd)],
-                           capture_output=True, timeout=timeout)
+                           capture_output=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return (124, "")
     except (FileNotFoundError, OSError):
@@ -517,29 +521,30 @@ PROBE_FAIL_THRESHOLD = 3
 PROBE_LOCKS = defaultdict(threading.Lock)   # one probe in flight per ip
 
 
-def probe_cuda_cached(ip):
+def probe_cuda_cached(ip, force=False):
     """0 = healthy, 1 = confirmed BROKEN (PROBE_FAIL_THRESHOLD consecutive
     rc=1 failures), 2 = inconclusive (transport/environment failure — NOT a
     GPU verdict; callers must not treat it as BROKEN).
 
-    The probe occupies GPU memory while it runs and is performed once per
-    state observation, including on occupied nodes, so a wedged CUDA context
-    cannot be hidden by USED. Only a confirmed BROKEN verdict is retained for
-    the process lifetime; healthy and inconclusive results are refreshed on
-    the next observation. The per-ip lock keeps concurrent callers from
-    probing the same node twice."""
-    if ip in PROBE_TS:
+    The probe occupies GPU memory while it runs (a CUDA context per GPU,
+    visible in nvidia-smi), so every verdict is trusted for COOLDOWN: one
+    probe per node per window instead of one per state poll. The verdict also
+    covers occupied nodes, so a wedged context cannot hide behind USED.
+
+    `force=True` bypasses the window. launch_trainer uses it so a node is
+    re-checked right before it is occupied: a healthy verdict from up to
+    COOLDOWN ago must not be able to hide a context that wedged since. The
+    per-ip lock keeps concurrent callers from probing the same node twice."""
+    now = time.time()
+    if not force and ip in PROBE_TS:
         ts, verdict = PROBE_TS[ip]
-        # Only confirmed BROKEN is reusable. Healthy and inconclusive results
-        # are per-observation values and must be re-probed on the next state
-        # collection so recovery and newly wedged contexts are detectable.
-        if verdict == 1:
+        if now - ts < COOLDOWN:
             return verdict
     with PROBE_LOCKS[ip]:
         # Another thread may have probed while we waited for the lock.
-        if ip in PROBE_TS:
+        if not force and ip in PROBE_TS:
             ts, verdict = PROBE_TS[ip]
-            if verdict == 1:
+            if time.time() - ts < COOLDOWN:
                 return verdict
         rc = probe_cuda(ip)
         if rc == 0:
@@ -618,7 +623,7 @@ def _safe_thread(fn):
     UI and look like input problems)."""
     def wrapper(*args, **kwargs):
         try:
-            fn(*args, **kwargs)
+            return fn(*args, **kwargs)
         except Exception as exc:  # noqa: BLE001
             try:
                 with open(LOG_FILE + ".err", "a") as fh:
@@ -630,6 +635,12 @@ def _safe_thread(fn):
 
 @_safe_thread
 def launch_trainer(ip):
+    # Re-probe right before occupying the node (bypassing the COOLDOWN cache):
+    # the state this launch decision was based on may be up to COOLDOWN old,
+    # and a context that wedged since would make the trainer die at init.
+    if probe_cuda_cached(ip, force=True) == 1:
+        set_message(f"{RED}train: {ip} probe says BROKEN — not launched{R}")
+        return False
     trainer = CONF.get("trainer", {})
     prefix = trainer.get("command", "")
     marker = trainer.get("marker", MARKER)
@@ -646,7 +657,8 @@ def launch_trainer(ip):
             prefix, marker, shlex.quote(launcher), shlex.quote(LOG_FILE))
         p = subprocess.Popen(["docker", "exec", "-d",
                               CONF.get("env", {}).get("container", ""),
-                              "bash", "-c", cmd])
+                              "bash", "-c", cmd],
+                             stdin=subprocess.DEVNULL)
     else:
         # Same quoting as above; the quotes shlex.quote adds are single
         # quotes, which the `escaped` rewrite below already survives.
@@ -654,20 +666,28 @@ def launch_trainer(ip):
         escaped = inner.replace("'", "'\\''")
         cmd = "setsid bash -c '%s' > %s 2>&1 < /dev/null &" % (escaped, shlex.quote(LOG_FILE))
         p = subprocess.Popen(["ssh", "-f", *ssh_opts(ip), node_host(ip),
-                              "bash -c " + shlex.quote(cmd)])
+                              "bash -c " + shlex.quote(cmd)],
+                             stdin=subprocess.DEVNULL)
     POPENS.append(p)
     _reap_popens()
     # Tracked for exit-time cleanup. NOTE: ssh -f / docker exec -d return
     # before the remote trainer actually exists, so _kill_launched_trainers
     # re-checks a moment later (see there).
     LAUNCHED.add(ip)
+    return True
 
 
 def spawn_launch(ip):
     """Launch a trainer off the UI thread and remember the thread so exit
     cleanup can join it first (a kill racing an in-flight launch would miss
-    the trainer)."""
-    t = threading.Thread(target=launch_trainer, args=(ip,), daemon=True)
+    the trainer). The launch thread re-probes the node first, so a BROKEN
+    verdict (and its message) lands after the command already reported
+    'started' — the message corrects that."""
+    def run():
+        if not launch_trainer(ip):
+            global RENDER_NOW
+            RENDER_NOW = True
+    t = threading.Thread(target=run, daemon=True)
     t.start()
     LAUNCH_THREADS.append(t)
 
@@ -1841,7 +1861,7 @@ def try_sweep():
             PENDING_TRY.discard(ip)
             TRY_FAILS.pop(ip, None)
         elif state == "IDLE":
-            if now - LAST_TRY_LAUNCH.get(ip, 0) > LAUNCH_COOLDOWN:
+            if now - LAST_TRY_LAUNCH.get(ip, 0) > COOLDOWN:
                 if TRY_FAILS.get(ip, 0) >= TRY_FAIL_LIMIT:
                     PENDING_TRY.discard(ip)
                     TRY_FAILS.pop(ip, None)
@@ -1953,10 +1973,11 @@ def main(argv=None):
     set_message(f"{GRAY}ready — type 'help'{R}")
     get_cols()
 
-    # Startup probe: one health snapshot per node, in parallel — the ONLY
-    # probe of the session (the probe occupies GPU memory while it runs).
-    # Verdicts land in the cache before the state workers need it and are
-    # then frozen for the process lifetime (see probe_cuda_cached).
+    # Startup probe: one health snapshot per node, in parallel, so the state
+    # workers start from a real verdict instead of each firing its own probe
+    # for the same node. Verdicts then hold for COOLDOWN (see
+    # probe_cuda_cached) — the workers re-probe at most once per window, not
+    # once per INTERVAL poll.
     for ip in IPS:
         threading.Thread(target=probe_cuda_cached, args=(ip,), daemon=True).start()
 

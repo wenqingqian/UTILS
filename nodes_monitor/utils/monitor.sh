@@ -146,17 +146,13 @@ NODE_ROOT="/workspace"
 CUDA_PROBE=""
 
 # Tuning knobs; all overridable via the [monitor] section of the config.
+# Cadence model, identical in manager.py: INTERVAL paces the cheap nvidia-smi
+# state poll only; COOLDOWN paces everything else — here it is the trust
+# window for cached CUDA-probe verdicts (the probe occupies GPU memory while
+# it runs: a CUDA context per GPU, visible in nvidia-smi), in manager.py the
+# probe window and the try_sweep re-launch throttle as well.
 INTERVAL=5
-# Trust window for cached CUDA-probe verdicts. The probe occupies GPU memory
-# while it runs (a CUDA context per GPU, visible in nvidia-smi), so it must
-# not fire casually: within COOLDOWN an earlier verdict is reused verbatim.
-# Default 12h.
-COOLDOWN=43200
-# Inconclusive (2) verdicts expire after PROBE_RETRY instead — re-probing
-# them touches no GPU (their failures happen at the transport/environment
-# layer), and this cadence also paces BROKEN confirmation
-# (PROBE_FAIL_THRESHOLD consecutive rc=1 failures, ~3 min apart by default).
-PROBE_RETRY=60
+COOLDOWN=600
 
 COMPUTE_THRESHOLD=0
 MEM_USED_THRESHOLD=100
@@ -503,8 +499,9 @@ probe_cuda_cached() {
         local rc=$?
         if (( rc == 1 )); then
             # The probe script itself ran and reported a GPU problem; only
-            # PROBE_FAIL_THRESHOLD consecutive failures (one per PROBE_RETRY)
-            # confirm BROKEN. Anything below that is a fluke.
+            # PROBE_FAIL_THRESHOLD consecutive failures confirm BROKEN.
+            # Anything below that is a fluke — such a verdict is stored as
+            # inconclusive and NOT reused, so the next call re-probes.
             if [[ -f "${fail_file}" ]]; then
                 fails="$(<"${fail_file}")"
             else

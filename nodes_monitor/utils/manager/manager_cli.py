@@ -150,16 +150,32 @@ def do_train(targets):
         else:
             outcomes[pos] = (False, f"FAIL({state})")
 
-    launched = []
-    for pos in launch_positions:
-        _, ip = targets[pos]
+    def launch_one(job):
+        pos, _ip = job
         try:
             # Fire-and-forget; the trainer must SURVIVE this process — see
             # the module docstring for why no cleanup is ever run here.
-            manager.launch_trainer(ip)
-            launched.append(pos)
+            # The launch re-probes the node first (the state pass above may
+            # be up to [monitor] cooldown old): True = launched, False =
+            # refused on a BROKEN verdict, None = the guarded launch itself
+            # died (exception logged to <log_file>.err). Launches run
+            # concurrently — that probe is ~2s of CUDA init per node, and
+            # serializing it would make `--train all` take minutes.
+            return pos, manager.launch_trainer(_ip)
         except Exception as exc:  # noqa: BLE001 — report, don't crash the run
-            outcomes[pos] = (False, f"FAIL(launch error: {exc})")
+            return pos, exc
+
+    launched = []
+    for pos, ok in run_parallel([(pos, targets[pos][1]) for pos in launch_positions],
+                                launch_one):
+        if ok is True:
+            launched.append(pos)
+        elif ok is False:
+            outcomes[pos] = (False, "FAIL(BROKEN)")
+        elif ok is None:                  # exception swallowed by the guard
+            outcomes[pos] = (False, "FAIL(launch error)")
+        else:                             # exception escaped launch_trainer
+            outcomes[pos] = (False, f"FAIL(launch error: {ok})")
 
     if launched:
         # ssh -f / docker exec -d return before the remote trainer process
